@@ -1,5 +1,44 @@
+# Python
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Env & secrets (never commit)
+.env
+.env.*
+!.env.example
+
+# Logs & local data
 logs/
 *.log
+*.sqlite3
+
+# AWS SAM / CDK / deploy artifacts
+.aws-sam/
+samconfig.toml.bak
+cdk.out/
+*.zip
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE (optional: keep if you don't want editor settings in repo)
+# .idea/
+# .vscode/
