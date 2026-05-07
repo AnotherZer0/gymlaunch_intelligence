@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: GymLaunch Intelligence — Slack sync Lambda
+
+Parameters:
+  DbHost:
+    Type: String
+  DbName:
+    Type: String
+    Default: gymlaunch_intelligence
+  DbUser:
+    Type: String
+    Default: gls_writer
+  DbPassword:
+    Type: String
+    NoEcho: true
+  SlackBotToken:
+    Type: String
+    NoEcho: true
+  DbSecurityGroupId:
+    Type: String
+  SubnetIds:
+    Type: CommaDelimitedList
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 900
+    MemorySize: 512
+    Environment:
+      Variables:
+        DB_HOST: !Ref DbHost
+        DB_NAME: !Ref DbName
+        DB_USER: !Ref DbUser
+        DB_PASSWORD: !Ref DbPassword
+        SLACK_BOT_TOKEN: !Ref SlackBotToken
+
+Resources:
+
+  SlackSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: gymlaunch-slack-sync
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/gymlaunch-lambda-boundary"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+  SlackSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-slack-sync
+      CodeUri: ../src/sync/slack/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        HourlySync:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Name: gymlaunch-slack-sync-hourly
+            Enabled: true
+
+  SlackSyncLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/gymlaunch-slack-sync
+      RetentionInDays: 30
+
+Outputs:
+  FunctionArn:
+    Value: !GetAtt SlackSyncFunction.Arn
+  RoleArn:
+    Value: !GetAtt SlackSyncRole.Arn

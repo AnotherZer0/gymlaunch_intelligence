@@ -1,0 +1,19 @@
+version = 0.1
+
+[default.build.parameters]
+template = "infra/template.yaml"
+
+[default.deploy.parameters]
+template_file = "infra/template.yaml"
+stack_name    = "gymlaunch-slack-sync"
+s3_bucket     = "gymlaunch-sam-artifacts"
+region        = "us-east-1"
+capabilities  = "CAPABILITY_NAMED_IAM"
+# Non-sensitive params only. DbPassword and SlackBotToken are injected by scripts/deploy.sh.
+parameter_overrides = [
+  "DbHost=gls.cdrq9b1h5qzb.us-east-1.rds.amazonaws.com",
+  "DbName=gymlaunch_intelligence",
+  "DbUser=gls_writer",
+  "DbSecurityGroupId=sg-64359563",
+  "SubnetIds=subnet-eb1f5bb4\\,subnet-57c0b831\\,subnet-d14d469c\\,subnet-f124a8c0\\,subnet-a085c381\\,subnet-3d566b33"
+]

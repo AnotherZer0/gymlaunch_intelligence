@@ -39,6 +39,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# claude
+.claude/worktrees/
 # IDE (optional: keep if you don't want editor settings in repo)
 # .idea/
 # .vscode/

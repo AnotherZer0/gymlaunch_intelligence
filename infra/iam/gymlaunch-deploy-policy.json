@@ -1,0 +1,166 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LambdaDeploy",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:GetFunction",
+        "lambda:ListFunctions",
+        "lambda:InvokeFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:ListTags",
+        "lambda:TagResource"
+      ],
+      "Resource": "arn:aws:lambda:us-east-1:321763729286:function:gymlaunch-*"
+    },
+    {
+      "Sid": "LambdaAddPermissionEventBridge",
+      "Effect": "Allow",
+      "Action": "lambda:AddPermission",
+      "Resource": "arn:aws:lambda:us-east-1:321763729286:function:gymlaunch-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceAccount": "321763729286"
+        },
+        "ArnLike": {
+          "aws:SourceArn": "arn:aws:events:us-east-1:321763729286:rule/gymlaunch-*"
+        }
+      }
+    },
+    {
+      "Sid": "EventBridgeSchedule",
+      "Effect": "Allow",
+      "Action": [
+        "events:PutRule",
+        "events:PutTargets",
+        "events:DescribeRule",
+        "events:RemoveTargets",
+        "events:ListTargetsByRule"
+      ],
+      "Resource": "arn:aws:events:us-east-1:321763729286:rule/gymlaunch-*"
+    },
+    {
+      "Sid": "CloudFormation",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateStack",
+        "cloudformation:UpdateStack",
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:GetTemplate",
+        "cloudformation:ValidateTemplate",
+        "cloudformation:ListStackResources",
+        "cloudformation:DescribeStackResource",
+        "cloudformation:CreateChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:DescribeChangeSet",
+        "cloudformation:DeleteChangeSet"
+      ],
+      "Resource": "arn:aws:cloudformation:us-east-1:321763729286:stack/gymlaunch-*/*"
+    },
+    {
+      "Sid": "S3ReadWrite",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:PutBucketVersioning",
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": [
+        "arn:aws:s3:::gymlaunch-*",
+        "arn:aws:s3:::gymlaunch-*/*"
+      ]
+    },
+    {
+      "Sid": "SecretsReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:ListSecrets"
+      ],
+      "Resource": "arn:aws:secretsmanager:*:*:secret:gymlaunch/*-*"
+    },
+    {
+      "Sid": "IAMCreateRoleWithBoundaryOnly",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:GetRole",
+        "iam:TagRole"
+      ],
+      "Resource": "arn:aws:iam::*:role/gymlaunch-*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PermissionsBoundary": "arn:aws:iam::321763729286:policy/gymlaunch-lambda-boundary"
+        }
+      }
+    },
+    {
+      "Sid": "IAMAttachApprovedPoliciesOnly",
+      "Effect": "Allow",
+      "Action": [
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::*:role/gymlaunch-*",
+      "Condition": {
+        "ArnEquals": {
+          "iam:PolicyARN": [
+            "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+            "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "IAMPassRoleToLambdaOnly",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::*:role/gymlaunch-*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "lambda.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:DescribeLogGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ExplicitDenyRDS",
+      "Effect": "Deny",
+      "Action": "rds:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ExplicitDenyDangerous",
+      "Effect": "Deny",
+      "Action": [
+        "iam:CreatePolicyVersion",
+        "iam:SetDefaultPolicyVersion",
+        "iam:PutRolePolicy",
+        "iam:DeleteRole",
+        "iam:DeleteRolePolicy",
+        "s3:DeleteObject",
+        "s3:DeleteBucket",
+        "lambda:DeleteFunction",
+        "secretsmanager:DeleteSecret"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
