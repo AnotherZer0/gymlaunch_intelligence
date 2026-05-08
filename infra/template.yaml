@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: GymLaunch Intelligence — Slack sync Lambda
+Description: GymLaunch Intelligence — data lake sync Lambdas
 
 Parameters:
   DbHost:
@@ -17,6 +17,9 @@ Parameters:
   SlackBotToken:
     Type: String
     NoEcho: true
+  AsanaToken:
+    Type: String
+    NoEcho: true
   DbSecurityGroupId:
     Type: String
   SubnetIds:
@@ -24,7 +27,7 @@ Parameters:
 
 Globals:
   Function:
-    Runtime: python3.12
+    Runtime: python3.11
     Timeout: 900
     MemorySize: 512
     Environment:
@@ -33,7 +36,6 @@ Globals:
         DB_NAME: !Ref DbName
         DB_USER: !Ref DbUser
         DB_PASSWORD: !Ref DbPassword
-        SLACK_BOT_TOKEN: !Ref SlackBotToken
 
 Resources:
 
@@ -59,6 +61,9 @@ Resources:
       CodeUri: ../src/sync/slack/
       Handler: handler.lambda_handler
       Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          SLACK_BOT_TOKEN: !Ref SlackBotToken
       VpcConfig:
         SecurityGroupIds:
           - !Ref DbSecurityGroupId
@@ -71,14 +76,34 @@ Resources:
             Name: gymlaunch-slack-sync-hourly
             Enabled: true
 
-  SlackSyncLogGroup:
-    Type: AWS::Logs::LogGroup
+  AsanaSyncFunction:
+    Type: AWS::Serverless::Function
     Properties:
-      LogGroupName: /aws/lambda/gymlaunch-slack-sync
-      RetentionInDays: 30
+      FunctionName: gymlaunch-asana-sync
+      CodeUri: ../src/sync/asana/agency_board/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          ASANA_TOKEN: !Ref AsanaToken
+          ASANA_PROJECT_GID: "1206006426591402"
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        HourlySync:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Name: gymlaunch-asana-sync-hourly
+            Enabled: true
+
 
 Outputs:
-  FunctionArn:
+  SlackFunctionArn:
     Value: !GetAtt SlackSyncFunction.Arn
+  AsanaFunctionArn:
+    Value: !GetAtt AsanaSyncFunction.Arn
   RoleArn:
     Value: !GetAtt SlackSyncRole.Arn

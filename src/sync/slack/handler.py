@@ -6,7 +6,8 @@ Triggered by EventBridge on a schedule.
 
 import json
 import os
-import psycopg2
+import ssl
+import pg8000
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from datetime import datetime, timezone
@@ -15,19 +16,20 @@ from datetime import datetime, timezone
 # --- Connections ---
 
 def get_db_connection():
-    return psycopg2.connect(
+    ctx = ssl.create_default_context()
+    return pg8000.connect(
         host=os.environ["DB_HOST"],
         port=5432,
-        dbname=os.environ["DB_NAME"],
+        database=os.environ["DB_NAME"],
         user=os.environ["DB_USER"],
         password=os.environ["DB_PASSWORD"],
-        sslmode="require",
-        connect_timeout=10,
+        ssl_context=ctx,
+        timeout=10,
     )
 
 
 def get_slack_client() -> WebClient:
-    return WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+    return WebClient(token=os.environ["SLACK_BOT_TOKEN"], timeout=30)
 
 
 # --- Internal domain classification ---
@@ -165,7 +167,11 @@ def sync_channel(cur, slack: WebClient, channel_id: str, channel_name: str, know
         if next_cursor:
             kwargs["cursor"] = next_cursor
 
-        response = slack.conversations_history(**kwargs)
+        print(f"  Calling conversations_history (cursor={next_cursor})")
+        try:
+            response = slack.conversations_history(**kwargs)
+        except Exception as e:
+            raise RuntimeError(f"conversations_history timed out or failed for {channel_name}: {e}") from e
         messages = response.get("messages", [])
 
         for msg in messages:
@@ -198,6 +204,26 @@ def sync_channel(cur, slack: WebClient, channel_id: str, channel_name: str, know
         next_cursor = response.get("response_metadata", {}).get("next_cursor")
         if not next_cursor:
             break
+
+    # Re-check all thread parents from the last 7 days so late replies are never missed.
+    # This is separate from the incremental message fetch — Slack doesn't resurface old
+    # parent messages when someone replies to them, so we query our own DB for thread
+    # parents and re-sync their replies directly.
+    cur.execute(
+        """
+        SELECT DISTINCT ts FROM slack_message
+        WHERE channel_id = %s
+          AND is_thread_reply = false
+          AND thread_ts IS NOT NULL
+          AND posted_at > now() - interval '7 days'
+        """,
+        (channel_id,)
+    )
+    thread_parents = [row[0] for row in cur.fetchall()]
+    if thread_parents:
+        print(f"  Re-checking {len(thread_parents)} thread(s) from last 7 days")
+        for parent_ts in thread_parents:
+            sync_thread(cur, slack, channel_id, parent_ts, known_users)
 
     update_sync_state(cur, channel_id, last_ts, status="ok")
     print(f"  Done: last_ts={last_ts}")

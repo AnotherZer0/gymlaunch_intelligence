@@ -24,10 +24,7 @@
       "Resource": "arn:aws:lambda:us-east-1:321763729286:function:gymlaunch-*",
       "Condition": {
         "StringEquals": {
-          "aws:SourceAccount": "321763729286"
-        },
-        "ArnLike": {
-          "aws:SourceArn": "arn:aws:events:us-east-1:321763729286:rule/gymlaunch-*"
+          "lambda:Principal": "events.amazonaws.com"
         }
       }
     },
@@ -55,12 +52,21 @@
         "cloudformation:ValidateTemplate",
         "cloudformation:ListStackResources",
         "cloudformation:DescribeStackResource",
-        "cloudformation:CreateChangeSet",
         "cloudformation:ExecuteChangeSet",
         "cloudformation:DescribeChangeSet",
-        "cloudformation:DeleteChangeSet"
+        "cloudformation:DeleteChangeSet",
+        "cloudformation:GetTemplateSummary"
       ],
       "Resource": "arn:aws:cloudformation:us-east-1:321763729286:stack/gymlaunch-*/*"
+    },
+    {
+      "Sid": "CloudFormationChangeSet",
+      "Effect": "Allow",
+      "Action": "cloudformation:CreateChangeSet",
+      "Resource": [
+        "arn:aws:cloudformation:us-east-1:321763729286:stack/gymlaunch-*/*",
+        "arn:aws:cloudformation:us-east-1:aws:transform/Serverless-2016-10-31"
+      ]
     },
     {
       "Sid": "S3ReadWrite",
@@ -89,11 +95,16 @@
       "Resource": "arn:aws:secretsmanager:*:*:secret:gymlaunch/*-*"
     },
     {
+      "Sid": "IAMGetRole",
+      "Effect": "Allow",
+      "Action": "iam:GetRole",
+      "Resource": "arn:aws:iam::*:role/gymlaunch-*"
+    },
+    {
       "Sid": "IAMCreateRoleWithBoundaryOnly",
       "Effect": "Allow",
       "Action": [
         "iam:CreateRole",
-        "iam:GetRole",
         "iam:TagRole"
       ],
       "Resource": "arn:aws:iam::*:role/gymlaunch-*",
@@ -137,6 +148,22 @@
       "Action": [
         "logs:CreateLogGroup",
         "logs:DescribeLogGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchLogsRetention",
+      "Effect": "Allow",
+      "Action": "logs:PutRetentionPolicy",
+      "Resource": "arn:aws:logs:us-east-1:321763729286:log-group:/aws/lambda/gymlaunch-*"
+    },
+    {
+      "Sid": "EC2DescribeForVPCLambda",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeVpcs"
       ],
       "Resource": "*"
     },
