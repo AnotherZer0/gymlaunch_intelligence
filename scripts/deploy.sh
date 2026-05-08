@@ -44,5 +44,8 @@ aws logs put-retention-policy \
 aws logs put-retention-policy \
   --log-group-name /aws/lambda/gymlaunch-asana-sync \
   --retention-in-days 30
+aws logs put-retention-policy \
+  --log-group-name /aws/lambda/gymlaunch-asana-deep-sync \
+  --retention-in-days 30
 
 echo "Done."

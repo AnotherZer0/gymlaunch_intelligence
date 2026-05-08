@@ -1,0 +1,71 @@
+HOW TO ADD A NEW CUSTOM FIELD
+==============================
+
+If someone adds a new custom field to the Agency Board in Asana and you want it
+synced to the database, follow these steps in order.
+
+The example below uses "Test Field" / test_field — replace with your actual field name.
+
+
+STEP 1 — handler.py: Add to the CF dict
+-----------------------------------------
+The left side is your internal key (snake_case), the right side is the exact field
+name as it appears in Asana.
+
+    CF = {
+        ...
+        "test_field": "Test Field",
+    }
+
+
+STEP 2 — handler.py: Add to HASH_FIELDS (optional)
+----------------------------------------------------
+Only do this if the field should trigger a HubSpot re-sync when its value changes.
+Skip it for internal-only or informational fields.
+
+    HASH_FIELDS = [
+        ...
+        "test_field",
+    ]
+
+
+STEP 3 — handler.py: Add to build_board_row()
+----------------------------------------------
+    def build_board_row(task_gid: str, cf_map: dict) -> dict:
+        return {
+            ...
+            "test_field": cf_map.get(CF["test_field"]),
+        }
+
+
+STEP 4 — handler.py: Add to upsert_board_row()
+-----------------------------------------------
+In the INSERT column list, VALUES tuple, ON CONFLICT DO UPDATE SET block, and the
+params tuple at the bottom — follow the same pattern as the existing fields.
+
+
+STEP 5 — New migration SQL
+---------------------------
+Create a new file in db/migrations/ (increment the number, e.g. 004_add_test_field.sql):
+
+    ALTER TABLE asana_agency_board_task
+        ADD COLUMN IF NOT EXISTS test_field TEXT;
+
+Use NUMERIC instead of TEXT for number fields (see ad_spend_budget_daily as an example).
+Use DATE for date fields (see ads_live_date as an example).
+
+
+STEP 6 — Deploy
+---------------
+1. Run the migration against the database first (pgAdmin query tool).
+2. Then redeploy the Lambda: bash scripts/deploy.sh
+
+
+NOTES
+------
+- The exact Asana field name (right side of CF dict) must match character-for-character
+  including spaces and capitalisation. Check it in Asana under the field settings.
+- If you're unsure of the exact name, check raw_payload in the asana_task table —
+  the full Asana API response is stored there and will include the field name.
+- Fields not listed in CF are silently ignored by the sync but are preserved in
+  raw_payload, so nothing is lost if you add them to CF later.

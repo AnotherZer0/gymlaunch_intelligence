@@ -1,8 +1,8 @@
 """
-Asana sync Lambda — Agency Board
-Pulls tasks, subtasks, comments, and custom fields from the Agency Board
-project into RDS. Incremental on subsequent runs via modified_since.
-Triggered by EventBridge on a schedule.
+Asana deep sync Lambda — subtasks and comments
+Runs daily. For every top-level task already in the DB, fetches subtasks
+and comments and upserts them. Designed to run after the hourly main sync
+has kept top-level tasks fresh.
 """
 
 import hashlib
@@ -17,7 +17,6 @@ import pg8000
 
 AGENCY_BOARD_PROJECT_GID = os.environ["ASANA_PROJECT_GID"]
 
-# Custom field names as they appear in Asana
 CF = {
     "gym_name":                 "Gym Name",
     "client_name":              "Client Name",
@@ -35,7 +34,6 @@ CF = {
     "ad_spend_budget_daily":    "Ad Spend Budget Daily",
 }
 
-# Fields hashed for HubSpot change detection (excludes coach, api_key)
 HASH_FIELDS = [
     "hubspot_company_id",
     "facebook_page_name",
@@ -74,7 +72,6 @@ def get_asana_client():
 # --- Custom field extraction ---
 
 def extract_custom_fields(task: dict) -> dict:
-    """Flatten custom_fields list into a keyed dict by field name."""
     cf_map = {}
     for field in task.get("custom_fields", []):
         name = field.get("name")
@@ -122,11 +119,6 @@ def build_board_row(task_gid: str, cf_map: dict) -> dict:
 
 
 def compute_content_hash(row: dict) -> str:
-    """
-    Deterministic SHA256 of HubSpot-relevant fields.
-    NULLs become empty string; numbers become their string representation.
-    Field order is fixed via HASH_FIELDS.
-    """
     parts = []
     field_map = {
         "hubspot_company_id":       row["hubspot_company_id"],
@@ -160,40 +152,7 @@ def upsert_user(cur, user: dict) -> None:
             email      = EXCLUDED.email,
             updated_at = now()
         """,
-        (
-            user["gid"],
-            user.get("name", ""),
-            user.get("email"),
-        ),
-    )
-
-
-def upsert_project(cur, project: dict) -> None:
-    workspace = project.get("workspace") or {}
-    team = project.get("team") or {}
-    cur.execute(
-        """
-        INSERT INTO asana_project (
-            gid, name, workspace_gid, workspace_name,
-            team_gid, team_name, archived, updated_at
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, now())
-        ON CONFLICT (gid) DO UPDATE SET
-            name           = EXCLUDED.name,
-            workspace_name = EXCLUDED.workspace_name,
-            team_name      = EXCLUDED.team_name,
-            archived       = EXCLUDED.archived,
-            updated_at     = now()
-        """,
-        (
-            project["gid"],
-            project.get("name", ""),
-            workspace.get("gid", ""),
-            workspace.get("name", ""),
-            team.get("gid"),
-            team.get("name"),
-            project.get("archived", False),
-        ),
+        (user["gid"], user.get("name", ""), user.get("email")),
     )
 
 
@@ -226,8 +185,7 @@ def upsert_task(cur, task: dict, project_gid: str, parent_gid: str | None = None
     section_name = None
     memberships = task.get("memberships") or []
     if memberships:
-        section = (memberships[0].get("section") or {})
-        section_name = section.get("name")
+        section_name = (memberships[0].get("section") or {}).get("name")
 
     due_on = parse_date(task.get("due_on"))
 
@@ -254,19 +212,10 @@ def upsert_task(cur, task: dict, project_gid: str, parent_gid: str | None = None
             updated_at        = now()
         """,
         (
-            task["gid"],
-            project_gid,
-            parent_gid,
-            assignee.get("gid"),
-            task.get("name", ""),
-            task.get("notes"),
-            section_name,
-            due_on,
-            task.get("completed", False),
-            completed_at,
-            asana_created_at,
-            asana_modified_at,
-            json.dumps(task),
+            task["gid"], project_gid, parent_gid, assignee.get("gid"),
+            task.get("name", ""), task.get("notes"), section_name, due_on,
+            task.get("completed", False), completed_at,
+            asana_created_at, asana_modified_at, json.dumps(task),
         ),
     )
 
@@ -306,22 +255,12 @@ def upsert_board_row(cur, row: dict) -> None:
             updated_at                  = now()
         """,
         (
-            row["task_gid"],
-            row["gym_name"],
-            row["client_name"],
-            row["agency_status"],
-            row["account_manager"],
-            row["media_buyer"],
-            row["coach"],
-            row["hubspot_company_id"],
-            row["facebook_page_name"],
-            row["facebook_page_id"],
-            row["facebook_ad_account_id"],
-            row["facebook_ad_account_name"],
-            row["hl_sub_account_location_id"],
-            row["ads_live_date"],
-            row["ad_spend_budget_daily"],
-            content_hash,
+            row["task_gid"], row["gym_name"], row["client_name"], row["agency_status"],
+            row["account_manager"], row["media_buyer"], row["coach"],
+            row["hubspot_company_id"], row["facebook_page_name"], row["facebook_page_id"],
+            row["facebook_ad_account_id"], row["facebook_ad_account_name"],
+            row["hl_sub_account_location_id"], row["ads_live_date"],
+            row["ad_spend_budget_daily"], content_hash,
         ),
     )
 
@@ -349,41 +288,13 @@ def upsert_comment(cur, story: dict, task_gid: str) -> None:
         ON CONFLICT (gid) DO UPDATE SET
             text = EXCLUDED.text
         """,
-        (
-            story["gid"],
-            task_gid,
-            author.get("gid"),
-            story.get("text"),
-            created_at,
-        ),
+        (story["gid"], task_gid, author.get("gid"), story.get("text"), created_at),
     )
 
 
-def update_sync_state(
-    cur, project_gid: str, last_modified_since,
-    status: str = "ok", error_message: str | None = None
-) -> None:
-    cur.execute(
-        """
-        INSERT INTO asana_sync_state (
-            project_gid, last_modified_since, last_synced_at, status, error_message, updated_at
-        )
-        VALUES (%s, %s, now(), %s, %s, now())
-        ON CONFLICT (project_gid) DO UPDATE SET
-            last_modified_since = EXCLUDED.last_modified_since,
-            last_synced_at      = now(),
-            status              = EXCLUDED.status,
-            error_message       = EXCLUDED.error_message,
-            updated_at          = now()
-        """,
-        (project_gid, last_modified_since, status, error_message),
-    )
+# --- Sync helpers ---
 
-
-# --- Subtasks and comments ---
-
-def sync_subtasks(cur, tasks_api, stories_api, parent_gid: str, project_gid: str) -> None:
-    """Fetch and upsert all subtasks of a task."""
+def sync_subtasks(cur, tasks_api, task_gid: str, project_gid: str) -> None:
     try:
         opts = {
             "opt_fields": (
@@ -392,28 +303,25 @@ def sync_subtasks(cur, tasks_api, stories_api, parent_gid: str, project_gid: str
                 "due_on,memberships.section.name,custom_fields.name,custom_fields.display_value"
             )
         }
-        subtasks = list(tasks_api.get_subtasks_for_task(parent_gid, opts))
+        subtasks = list(tasks_api.get_subtasks_for_task(task_gid, opts))
     except Exception as e:
-        print(f"    Could not fetch subtasks for {parent_gid}: {e}")
+        print(f"  Could not fetch subtasks for {task_gid}: {e}")
         return
 
     for subtask in subtasks:
-        upsert_task(cur, subtask, project_gid, parent_gid)
+        upsert_task(cur, subtask, project_gid, task_gid)
         cf_map = extract_custom_fields(subtask)
-        board_row = build_board_row(subtask["gid"], cf_map)
-        upsert_board_row(cur, board_row)
-        sync_comments(cur, stories_api, subtask["gid"])
+        upsert_board_row(cur, build_board_row(subtask["gid"], cf_map))
 
 
 def sync_comments(cur, stories_api, task_gid: str) -> None:
-    """Fetch and upsert all comment stories for a task."""
     try:
         opts = {
             "opt_fields": "gid,type,text,created_at,created_by.gid,created_by.name,created_by.email"
         }
         stories = list(stories_api.get_stories_for_task(task_gid, opts))
     except Exception as e:
-        print(f"    Could not fetch comments for {task_gid}: {e}")
+        print(f"  Could not fetch comments for {task_gid}: {e}")
         return
 
     for story in stories:
@@ -421,79 +329,10 @@ def sync_comments(cur, stories_api, task_gid: str) -> None:
             upsert_comment(cur, story, task_gid)
 
 
-# --- Project sync ---
-
-def sync_project(cur, conn, api_client, project_gid: str) -> None:
-    tasks_api = asana.TasksApi(api_client)
-    stories_api = asana.StoriesApi(api_client)
-    projects_api = asana.ProjectsApi(api_client)
-
-    # Fetch project metadata
-    print(f"Fetching project {project_gid}")
-    try:
-        project = projects_api.get_project(
-            project_gid,
-            {"opt_fields": "gid,name,archived,workspace.gid,workspace.name,team.gid,team.name"}
-        )
-        upsert_project(cur, project)
-        conn.commit()
-    except Exception as e:
-        raise RuntimeError(f"Could not fetch project {project_gid}: {e}") from e
-
-    # Check last sync time for incremental pull
-    cur.execute(
-        "SELECT last_modified_since FROM asana_sync_state WHERE project_gid = %s",
-        (project_gid,)
-    )
-    row = cur.fetchone()
-    last_modified_since = row[0] if row and row[0] else None
-    sync_started_at = datetime.now(timezone.utc)
-
-    if last_modified_since:
-        print(f"  Incremental sync since {last_modified_since.isoformat()}")
-    else:
-        print("  Full historical sync (first run)")
-
-    opts = {
-        "opt_fields": (
-            "gid,name,notes,completed,completed_at,created_at,modified_at,"
-            "assignee.gid,assignee.name,assignee.email,"
-            "due_on,memberships.section.name,"
-            "custom_fields.name,custom_fields.display_value"
-        ),
-        "limit": 100,
-    }
-    if last_modified_since:
-        opts["modified_since"] = last_modified_since.isoformat()
-
-    task_count = 0
-    try:
-        tasks = tasks_api.get_tasks_for_project(project_gid, opts)
-        for task in tasks:
-            upsert_task(cur, task, project_gid, parent_gid=None)
-
-            cf_map = extract_custom_fields(task)
-            board_row = build_board_row(task["gid"], cf_map)
-            upsert_board_row(cur, board_row)
-
-            conn.commit()
-
-            task_count += 1
-            if task_count % 100 == 0:
-                print(f"  {task_count} tasks processed...")
-
-    except Exception as e:
-        raise RuntimeError(f"Task fetch failed for project {project_gid}: {e}") from e
-
-    print(f"  Done: {task_count} top-level tasks processed")
-    update_sync_state(cur, project_gid, sync_started_at, status="ok")
-    conn.commit()
-
-
 # --- Lambda entry point ---
 
 def lambda_handler(event, context):
-    print("Asana sync starting")
+    print("Asana deep sync starting")
 
     api_client = get_asana_client()
     conn = get_db_connection()
@@ -501,27 +340,35 @@ def lambda_handler(event, context):
     try:
         cur = conn.cursor()
 
-        cur.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (AGENCY_BOARD_PROJECT_GID,))
+        cur.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (AGENCY_BOARD_PROJECT_GID + "_deep",))
         if not cur.fetchone()[0]:
-            print("Another sync is already running, exiting")
-            return {"statusCode": 200, "body": "Skipped: sync already running"}
+            print("Another deep sync is already running, exiting")
+            return {"statusCode": 200, "body": "Skipped: deep sync already running"}
 
-        try:
-            sync_project(cur, conn, api_client, AGENCY_BOARD_PROJECT_GID)
-        except Exception as e:
-            print(f"ERROR syncing project {AGENCY_BOARD_PROJECT_GID}: {e}")
-            try:
-                cur2 = conn.cursor()
-                update_sync_state(cur2, AGENCY_BOARD_PROJECT_GID, None, status="error", error_message=str(e))
-                conn.commit()
-                cur2.close()
-            except Exception:
-                pass
-            raise
+        tasks_api = asana.TasksApi(api_client)
+        stories_api = asana.StoriesApi(api_client)
 
-        cur.close()
-        print("Asana sync complete")
-        return {"statusCode": 200, "body": "Sync complete"}
+        cur.execute(
+            "SELECT gid FROM asana_task WHERE parent_task_gid IS NULL AND project_gid = %s",
+            (AGENCY_BOARD_PROJECT_GID,)
+        )
+        task_gids = [row[0] for row in cur.fetchall()]
+        print(f"Deep syncing {len(task_gids)} tasks")
+
+        for i, task_gid in enumerate(task_gids):
+            sync_subtasks(cur, tasks_api, task_gid, AGENCY_BOARD_PROJECT_GID)
+            sync_comments(cur, stories_api, task_gid)
+            conn.commit()
+
+            if (i + 1) % 100 == 0:
+                print(f"  {i + 1} tasks deep synced...")
+
+        print(f"Deep sync complete: {len(task_gids)} tasks processed")
+        return {"statusCode": 200, "body": "Deep sync complete"}
+
+    except Exception as e:
+        print(f"ERROR during deep sync: {e}")
+        raise
 
     finally:
         conn.close()

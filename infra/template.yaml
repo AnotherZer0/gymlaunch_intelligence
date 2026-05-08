@@ -100,10 +100,35 @@ Resources:
             Enabled: true
 
 
+  AsanaDeepSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-asana-deep-sync
+      CodeUri: ../src/sync/asana/deep/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          ASANA_TOKEN: !Ref AsanaToken
+          ASANA_PROJECT_GID: "1206006426591402"
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        DailySync:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Name: gymlaunch-asana-deep-sync-daily
+            Enabled: true
+
 Outputs:
   SlackFunctionArn:
     Value: !GetAtt SlackSyncFunction.Arn
   AsanaFunctionArn:
     Value: !GetAtt AsanaSyncFunction.Arn
+  AsanaDeepSyncFunctionArn:
+    Value: !GetAtt AsanaDeepSyncFunction.Arn
   RoleArn:
     Value: !GetAtt SlackSyncRole.Arn

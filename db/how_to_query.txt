@@ -1,0 +1,100 @@
+HOW TO QUERY AND UPDATE THE ASANA DATA
+=======================================
+
+All queries below can be run in pgAdmin using the Query Tool.
+Connect to the gymlaunch_intelligence database first.
+
+
+STAFF AVAILABILITY
+------------------
+See everyone's current active client count, capacity, and free slots:
+
+    SELECT * FROM staff_availability;
+
+Filter to just media buyers:
+
+    SELECT * FROM staff_availability WHERE role = 'media_buyer';
+
+Filter to just account managers:
+
+    SELECT * FROM staff_availability WHERE role = 'account_manager';
+
+This view is live -- it recalculates every time you run it based on the
+latest data synced from Asana (updates hourly).
+
+
+UPDATING SOMEONE'S CAPACITY
+----------------------------
+If a team member's max client count changes, update it here.
+
+Update a media buyer:
+
+    UPDATE agency_staff_capacity SET capacity = 25
+    WHERE name = 'Rajiv' AND role = 'media_buyer';
+
+Update an account manager:
+
+    UPDATE agency_staff_capacity SET capacity = 25
+    WHERE name = 'Rajiv' AND role = 'account_manager';
+
+If someone does both roles you need two separate UPDATE statements,
+one for each role.
+
+The name must match exactly how it appears in Asana (same spelling,
+same capitalisation). To check what names are in the system:
+
+    SELECT DISTINCT media_buyer FROM asana_agency_board_task ORDER BY 1;
+    SELECT DISTINCT account_manager FROM asana_agency_board_task ORDER BY 1;
+
+
+ADDING A NEW TEAM MEMBER
+-------------------------
+    INSERT INTO agency_staff_capacity (name, role, capacity)
+    VALUES ('New Person', 'media_buyer', 40);
+
+    INSERT INTO agency_staff_capacity (name, role, capacity)
+    VALUES ('New Person', 'account_manager', 40);
+
+
+REMOVING A TEAM MEMBER
+-----------------------
+    DELETE FROM agency_staff_capacity WHERE name = 'Old Person';
+
+This removes both roles if they had both.
+
+
+LOOKING UP A SPECIFIC CLIENT
+-----------------------------
+Find a client by gym name:
+
+    SELECT * FROM asana_agency_board_task WHERE gym_name ILIKE '%your search%';
+
+ILIKE means the search is case-insensitive. The % on each side means
+"anything before or after" -- so '%gold%' would match "Gold's Gym",
+"Golden Fitness", etc.
+
+
+SEEING ALL ACTIVE CLIENTS FOR A SPECIFIC PERSON
+------------------------------------------------
+    SELECT
+        t.section_name,
+        ab.gym_name,
+        ab.client_name,
+        ab.agency_status,
+        ab.account_manager,
+        ab.media_buyer
+    FROM asana_agency_board_task ab
+    JOIN asana_task t ON t.gid = ab.task_gid
+    WHERE ab.media_buyer = 'James'
+      AND t.section_name IN ('Onboarding','Ready To Go Live','Downed Account','Active Accounts')
+    ORDER BY t.section_name, ab.gym_name;
+
+Replace 'James' with any name. Change media_buyer to account_manager
+to filter by AM instead.
+
+
+CHECKING WHEN DATA WAS LAST SYNCED
+------------------------------------
+    SELECT * FROM asana_sync_state;
+
+Shows the last time the Lambda successfully synced and whether it errored.
