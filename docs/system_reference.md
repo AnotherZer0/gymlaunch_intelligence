@@ -31,9 +31,9 @@ but changing it would require tearing down and recreating all resources, so it s
 | Function name | Schedule | Source |
 |---|---|---|
 | `gymlaunch-slack-sync` | Every hour | `src/sync/slack/` |
-| `gymlaunch-asana-sync` | Every hour, top of hour | `src/sync/asana/agency_board/` |
-| `gymlaunch-asana-deep-sync` | Once daily | `src/sync/asana/deep/` |
-| `gymlaunch-hubspot-sync` | Every hour, :10 past | `src/sync/hubspot/` |
+| `gymlaunch-asana-agency-board-sync` | Every hour, top of hour | `src/sync/asana/agency_board/` |
+| `gymlaunch-asana-agency-board-deep-sync` | Once daily | `src/sync/asana/deep/` |
+| `gymlaunch-sync-agency-board-to-hubspot` | Every hour, :10 past | `src/sync/hubspot/` |
 | `gymlaunch-mb-capacity-sheet-sync` | 8am, 12pm, 4pm, 8pm EDT | `src/sync/sheets/` |
 
 All functions run in the VPC (subnets `subnet-a085c381`, `subnet-3d566b33`) so they can reach RDS.  
@@ -44,9 +44,9 @@ Permissions boundary: `gymlaunch-lambda-boundary`.
 
 ```
 /aws/lambda/gymlaunch-slack-sync
-/aws/lambda/gymlaunch-asana-sync
-/aws/lambda/gymlaunch-asana-deep-sync
-/aws/lambda/gymlaunch-hubspot-sync
+/aws/lambda/gymlaunch-asana-agency-board-sync
+/aws/lambda/gymlaunch-asana-agency-board-deep-sync
+/aws/lambda/gymlaunch-sync-agency-board-to-hubspot
 /aws/lambda/gymlaunch-mb-capacity-sheet-sync
 ```
 

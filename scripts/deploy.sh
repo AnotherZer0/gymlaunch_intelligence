@@ -55,13 +55,13 @@ aws logs put-retention-policy \
   --log-group-name /aws/lambda/gymlaunch-slack-sync \
   --retention-in-days 30
 aws logs put-retention-policy \
-  --log-group-name /aws/lambda/gymlaunch-asana-sync \
+  --log-group-name /aws/lambda/gymlaunch-asana-agency-board-sync \
   --retention-in-days 30
 aws logs put-retention-policy \
-  --log-group-name /aws/lambda/gymlaunch-asana-deep-sync \
+  --log-group-name /aws/lambda/gymlaunch-asana-agency-board-deep-sync \
   --retention-in-days 30
 aws logs put-retention-policy \
-  --log-group-name /aws/lambda/gymlaunch-hubspot-sync \
+  --log-group-name /aws/lambda/gymlaunch-sync-agency-board-to-hubspot \
   --retention-in-days 30
 aws logs put-retention-policy \
   --log-group-name /aws/lambda/gymlaunch-mb-capacity-sheet-sync \

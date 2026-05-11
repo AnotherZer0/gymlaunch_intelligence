@@ -87,7 +87,7 @@ Resources:
   AsanaSyncFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: gymlaunch-asana-sync
+      FunctionName: gymlaunch-asana-agency-board-sync
       CodeUri: ../src/sync/asana/agency_board/
       Handler: handler.lambda_handler
       Role: !GetAtt SlackSyncRole.Arn
@@ -104,13 +104,13 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: cron(0 * * * ? *)
-            Name: gymlaunch-asana-sync-hourly
+            Name: gymlaunch-asana-agency-board-sync-hourly
             Enabled: true
 
   HubspotSyncFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: gymlaunch-hubspot-sync
+      FunctionName: gymlaunch-sync-agency-board-to-hubspot
       CodeUri: ../src/sync/hubspot/
       Handler: handler.lambda_handler
       Role: !GetAtt SlackSyncRole.Arn
@@ -126,7 +126,7 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: cron(10 * * * ? *)
-            Name: gymlaunch-hubspot-sync-hourly
+            Name: gymlaunch-sync-agency-board-to-hubspot-hourly
             Enabled: true
 
 
@@ -156,7 +156,7 @@ Resources:
   AsanaDeepSyncFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: gymlaunch-asana-deep-sync
+      FunctionName: gymlaunch-asana-agency-board-deep-sync
       CodeUri: ../src/sync/asana/deep/
       Handler: handler.lambda_handler
       Role: !GetAtt SlackSyncRole.Arn
@@ -173,17 +173,17 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: rate(1 day)
-            Name: gymlaunch-asana-deep-sync-daily
+            Name: gymlaunch-asana-agency-board-deep-sync-daily
             Enabled: true
 
 Outputs:
   SlackFunctionArn:
     Value: !GetAtt SlackSyncFunction.Arn
-  AsanaFunctionArn:
+  AsanaAgencyBoardSyncFunctionArn:
     Value: !GetAtt AsanaSyncFunction.Arn
-  AsanaDeepSyncFunctionArn:
+  AsanaAgencyBoardDeepSyncFunctionArn:
     Value: !GetAtt AsanaDeepSyncFunction.Arn
-  HubspotSyncFunctionArn:
+  AgencyBoardToHubspotSyncFunctionArn:
     Value: !GetAtt HubspotSyncFunction.Arn
   SheetsSyncFunctionArn:
     Value: !GetAtt SheetsSyncFunction.Arn
