@@ -20,6 +20,9 @@ Parameters:
   AsanaToken:
     Type: String
     NoEcho: true
+  HubspotToken:
+    Type: String
+    NoEcho: true
   DbSecurityGroupId:
     Type: String
   SubnetIds:
@@ -95,8 +98,30 @@ Resources:
         HourlySync:
           Type: Schedule
           Properties:
-            Schedule: rate(1 hour)
+            Schedule: cron(0 * * * ? *)
             Name: gymlaunch-asana-sync-hourly
+            Enabled: true
+
+  HubspotSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-hubspot-sync
+      CodeUri: ../src/sync/hubspot/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          HUBSPOT_TOKEN: !Ref HubspotToken
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        HourlySync:
+          Type: Schedule
+          Properties:
+            Schedule: cron(10 * * * ? *)
+            Name: gymlaunch-hubspot-sync-hourly
             Enabled: true
 
 
@@ -130,5 +155,7 @@ Outputs:
     Value: !GetAtt AsanaSyncFunction.Arn
   AsanaDeepSyncFunctionArn:
     Value: !GetAtt AsanaDeepSyncFunction.Arn
+  HubspotSyncFunctionArn:
+    Value: !GetAtt HubspotSyncFunction.Arn
   RoleArn:
     Value: !GetAtt SlackSyncRole.Arn

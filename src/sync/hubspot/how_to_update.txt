@@ -1,0 +1,97 @@
+HOW TO ADD A NEW FIELD TO THE HUBSPOT SYNC
+==========================================
+
+Follow these steps in order. The example uses a field called "test_field".
+
+
+STEP 1 — Add the column to the DB (if it doesn't exist already)
+----------------------------------------------------------------
+Create a new migration file in db/migrations/ (increment the number):
+
+    ALTER TABLE asana_agency_board_task
+        ADD COLUMN IF NOT EXISTS test_field TEXT;
+
+Run it in pgAdmin before deploying.
+
+
+STEP 2 — Add it to the Asana sync handler
+------------------------------------------
+So the column gets populated from Asana. See:
+    src/sync/asana/agency_board/how_to_update.txt
+
+If the field already exists in the DB from another source, skip this step.
+
+
+STEP 3 — Add it to fetch_pending_rows() in handler.py
+-------------------------------------------------------
+Add the column name to the SELECT:
+
+    SELECT
+        ...
+        test_field,
+        ...
+    FROM asana_agency_board_task
+    ...
+
+
+STEP 4 — Add it to build_properties() in handler.py
+----------------------------------------------------
+Map the DB column to the HubSpot internal property name:
+
+    def build_properties(row, am_hubspot_id):
+        return {
+            ...
+            "hubspot_internal_property_name": row["test_field"],
+        }
+
+The HubSpot internal property name is found in HubSpot under:
+    Settings → Properties → (find your property) → Internal name
+
+It is NOT the display label — it is the snake_case name shown under the label.
+
+
+STEP 5 — Decide if it should trigger a re-sync
+-----------------------------------------------
+If a change to this field should cause HubSpot to be updated, add it to
+HASH_FIELDS in src/sync/asana/agency_board/handler.py so the content_hash
+changes when the field changes.
+
+If it is informational-only and doesn't need to drive HubSpot updates,
+you can skip this.
+
+
+STEP 6 — Deploy
+---------------
+    bash scripts/deploy.sh
+
+
+NOTES
+------
+- HubSpot date properties expect epoch milliseconds (UTC midnight).
+  Use the to_epoch_ms() helper already in handler.py.
+- HubSpot number properties should be plain numbers, not strings.
+- None values are automatically stripped before sending to HubSpot —
+  you do not need to handle nulls manually.
+- To find the internal name of any HubSpot property:
+  HubSpot → Settings → Data Management → Properties → search for it →
+  click it → "Internal name" shown below the label field.
+
+
+MANAGING ACCOUNT MANAGERS
+--------------------------
+The account_manager field is looked up in the account_manager_hubspot_map
+table — it maps the Asana display name to a HubSpot owner/user ID.
+
+To add a new AM:
+
+    INSERT INTO account_manager_hubspot_map (name, hubspot_id)
+    VALUES ('New Person', 'their-hubspot-id');
+
+To update an existing AM's HubSpot ID:
+
+    UPDATE account_manager_hubspot_map
+    SET hubspot_id = 'new-id', updated_at = now()
+    WHERE name = 'Person Name';
+
+The HubSpot owner ID can be found in HubSpot under:
+    Settings → Users & Teams → click the user → the ID is in the URL.

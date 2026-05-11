@@ -21,6 +21,11 @@ ASANA_TOKEN=$(aws secretsmanager get-secret-value \
   --query SecretString --output text \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
+HUBSPOT_TOKEN=$(aws secretsmanager get-secret-value \
+  --secret-id gymlaunch/hubspot/token \
+  --query SecretString --output text \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
 echo "Building..."
 sam build
 
@@ -35,7 +40,8 @@ sam deploy \
     "SubnetIds=subnet-a085c381,subnet-3d566b33" \
     "DbPassword=${DB_PASSWORD}" \
     "SlackBotToken=${SLACK_BOT_TOKEN}" \
-    "AsanaToken=${ASANA_TOKEN}"
+    "AsanaToken=${ASANA_TOKEN}" \
+    "HubspotToken=${HUBSPOT_TOKEN}"
 
 echo "Setting log retention..."
 aws logs put-retention-policy \
@@ -46,6 +52,9 @@ aws logs put-retention-policy \
   --retention-in-days 30
 aws logs put-retention-policy \
   --log-group-name /aws/lambda/gymlaunch-asana-deep-sync \
+  --retention-in-days 30
+aws logs put-retention-policy \
+  --log-group-name /aws/lambda/gymlaunch-hubspot-sync \
   --retention-in-days 30
 
 echo "Done."
