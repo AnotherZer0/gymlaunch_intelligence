@@ -23,6 +23,11 @@ Parameters:
   HubspotToken:
     Type: String
     NoEcho: true
+  GoogleServiceAccountB64:
+    Type: String
+    NoEcho: true
+  GoogleSheetId:
+    Type: String
   DbSecurityGroupId:
     Type: String
   SubnetIds:
@@ -125,6 +130,29 @@ Resources:
             Enabled: true
 
 
+  SheetsSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-mb-capacity-sheet-sync
+      CodeUri: ../src/sync/sheets/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          GOOGLE_SERVICE_ACCOUNT_B64: !Ref GoogleServiceAccountB64
+          GOOGLE_SHEET_ID: !Ref GoogleSheetId
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        BusinessHoursSync:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 12,16,20,0 * * ? *)
+            Name: gymlaunch-sheets-sync-biz-hours
+            Enabled: true
+
   AsanaDeepSyncFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -157,5 +185,7 @@ Outputs:
     Value: !GetAtt AsanaDeepSyncFunction.Arn
   HubspotSyncFunctionArn:
     Value: !GetAtt HubspotSyncFunction.Arn
+  SheetsSyncFunctionArn:
+    Value: !GetAtt SheetsSyncFunction.Arn
   RoleArn:
     Value: !GetAtt SlackSyncRole.Arn
