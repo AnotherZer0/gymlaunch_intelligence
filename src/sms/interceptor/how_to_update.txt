@@ -1,0 +1,176 @@
+SMS Interceptor — How It Works & How to Update
+===============================================
+
+HOW IT WORKS
+------------
+The gymlaunch-sms-interceptor Lambda sits in front of Octopods for all inbound
+Twilio traffic. Every SMS received on one of our Twilio numbers, and every delivery
+status callback, hits this Lambda first.
+
+For inbound messages (/sms/inbound):
+  1. Validates the Twilio HMAC-SHA1 signature — rejects spoofed requests with 403
+  2. Identifies which channel the message arrived on (Marketing / Product Updates)
+     using the TWILIO_NUMBER_CHANNELS mapping in template.yaml
+  3. Checks if the body exactly matches an opt-out keyword (case-insensitive):
+       STOP, STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT, OPTOUT, REVOKE
+       - Searches HubSpot for the sender by mobilephone, then phone
+       - Removes the channel from sms_subscriptions (multiple-checkbox property)
+       - Sets sms_*_opted_out = true
+       - Sets sms_marketing_opted_out_date (Marketing channel only)
+       - Creates a note on the contact timeline
+  4. Checks if the body is an opt-in keyword (START, UNSTOP, YES)
+       - Finds the contact
+       - Adds the channel back to sms_subscriptions
+       - Sets sms_*_opted_out = false
+       - Creates a note on the contact timeline
+  5. Writes a row to sms_inbound_message in RDS
+  6. Forwards the raw request body to Octopods (so HubSpot Conversations still works)
+  7. Returns empty TwiML <Response/> — Twilio handles STOP auto-replies at carrier level
+
+For delivery status callbacks (/sms/status):
+  1. Validates signature
+  2. If error_code is 30006 (geo block), 30007 (carrier violation), or 30008 (carrier error):
+       - Finds the recipient contact in HubSpot
+       - Sets sms_deliverable = false
+       - Sets sms_ineligible_reason to the mapped reason code
+  3. Writes a row to sms_delivery_event in RDS
+  4. Forwards to Octopods
+  5. Returns 200
+
+The Lambda always returns 200 to Twilio, even on internal errors. This prevents
+Twilio from retrying the webhook, which would cause duplicate DB rows and duplicate
+HubSpot updates.
+
+
+HubSpot PROPERTIES WRITTEN BY THIS LAMBDA
+------------------------------------------
+All of these must be created in HubSpot portal 43776308 before deploying.
+If a property doesn't exist, HubSpot returns 400 and the Lambda logs it but continues.
+
+Property name                    Type                  Notes
+----------------------------     ------------------    ----------------------------
+sms_subscriptions                Multiple checkboxes   Enrollment state per channel.
+                                                       Internal names MUST match the
+                                                       channel names in _CHANNEL_PROPS
+                                                       in handler.py (case-sensitive).
+                                                       Current options: Marketing,
+                                                       Product Updates, Support
+
+sms_marketing_opted_out          Checkbox (boolean)    Set true on STOP, false on START
+sms_product_updates_opted_out    Checkbox (boolean)    Set true on STOP, false on START
+sms_marketing_opted_out_date     Date (date picker)    Timestamp of most recent
+                                                       Marketing STOP. Not cleared on
+                                                       START — history is preserved.
+sms_deliverable                  Checkbox (boolean)    Set false on hard delivery failure
+sms_ineligible_reason            Single-line text      Reason code: geo_block |
+                                                       carrier_violation | carrier_error
+
+
+HOW TO ADD A NEW TWILIO NUMBER (same channel)
+---------------------------------------------
+Example: adding +12135001234 to the Marketing channel.
+
+1. Open infra/template.yaml
+2. Find TWILIO_NUMBER_CHANNELS under SmsInterceptorFunction → Environment → Variables
+3. Add the number to the Marketing array:
+     TWILIO_NUMBER_CHANNELS: '{"Marketing": ["+12135661157", "+12135613526", "+12135795481", "+12135001234"]}'
+4. Deploy:
+     bash scripts/deploy.sh
+5. In Twilio console: set the new number's Messaging Service inbound webhook URL to
+   the SmsApiUrl from CloudFormation outputs + /sms/inbound
+
+
+HOW TO ADD A NEW CHANNEL
+-------------------------
+Example: adding a "Product Updates" number +12135009999.
+
+Step 1 — Create HubSpot properties (if not already done):
+  - sms_product_updates_opted_out  (Checkbox)
+  - Add "Product Updates" as an option to sms_subscriptions if not present
+    (the internal name must match exactly what you use in _CHANNEL_PROPS below)
+
+Step 2 — Add channel config in handler.py:
+  Find _CHANNEL_PROPS and add an entry:
+    "Product Updates": {
+        "opted_out":          "sms_product_updates_opted_out",
+        "opted_out_date":     None,   # add a date property here if you want one
+        "subscription_value": "Product Updates",
+    },
+
+Step 3 — Add the number to template.yaml:
+  TWILIO_NUMBER_CHANNELS: '{"Marketing": [...], "Product Updates": ["+12135009999"]}'
+
+Step 4 — Deploy:
+  bash scripts/deploy.sh
+
+Step 5 — Update Twilio:
+  Point the new number's inbound webhook at {SmsApiUrl}/sms/inbound
+
+
+HOW TO FIND THE API GATEWAY URL AFTER DEPLOY
+--------------------------------------------
+  aws cloudformation describe-stacks \
+    --stack-name gymlaunch-slack-sync \
+    --query "Stacks[0].Outputs[?OutputKey=='SmsApiUrl'].OutputValue" \
+    --output text
+
+Append /sms/inbound for the Twilio inbound webhook.
+Append /sms/status for the Twilio StatusCallback URL.
+
+
+HOW TO CHECK OPT-OUT HISTORY IN RDS
+-------------------------------------
+-- All opt-outs in the last 30 days by channel
+SELECT channel, opt_out_keyword, from_number, received_at
+FROM sms_inbound_message
+WHERE opt_out_keyword IS NOT NULL
+  AND received_at > now() - interval '30 days'
+ORDER BY received_at DESC;
+
+-- Opt-out rate by channel (rough — denominator is all inbound, not sends)
+SELECT channel,
+       COUNT(*) FILTER (WHERE opt_out_keyword IS NOT NULL) AS opt_outs,
+       COUNT(*) AS total_inbound,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE opt_out_keyword IS NOT NULL) / COUNT(*), 1) AS opt_out_pct
+FROM sms_inbound_message
+GROUP BY channel;
+
+-- Hard delivery failures by error code
+SELECT error_code, COUNT(*) AS count
+FROM sms_delivery_event
+WHERE error_code IS NOT NULL
+GROUP BY error_code
+ORDER BY count DESC;
+
+
+CHANNEL MAPPING REFERENCE (current as of last deploy)
+------------------------------------------------------
++12135661157  →  Marketing
++12135613526  →  Marketing
++12135795481  →  Marketing
+
+Numbers not in the mapping receive channel = "Unknown" in the DB.
+They are still forwarded to Octopods and written to RDS — only the HubSpot
+opt-out logic is skipped (since we don't know which properties to update).
+
+
+SECRETS USED BY THIS LAMBDA
+-----------------------------
+gymlaunch/hubspot/token        HubSpot Private App token
+gymlaunch/twilio/auth_token    Twilio auth token (for Twilio signature validation)
+gymlaunch/twilio/octopods_webhook_urls  Per-number Octopods forwarding URLs (JSON)
+
+The octopods_webhook_urls secret is a JSON object keyed by our Twilio number in E.164:
+  {
+    "+12135613526": "https://app.octopods.io/channels/twilio/hubspot/notification/KyZWXu-LSNswdGeq",
+    "+12135795481": "https://app.octopods.io/channels/twilio/hubspot/notification/FrvtvMO37LYTkjCa",
+    "+12135661157": "https://app.octopods.io/channels/twilio/hubspot/notification/U5U3zO49mfKc6aq6"
+  }
+
+Each Twilio number has its own Octopods webhook token. If you add a new number,
+add its entry to this secret (aws secretsmanager update-secret) then redeploy.
+
+PHASE 3 NOTE: When Octopods is replaced entirely, the OCTOPODS_WEBHOOK_URLS env
+var and _OCTOPODS_URL_MAP in handler.py are removed. All inbound traffic routes
+through our own Lambda, and all outbound sends go through our own outbound Lambda
+with a single StatusCallback URL. The per-number forwarding complexity goes away.

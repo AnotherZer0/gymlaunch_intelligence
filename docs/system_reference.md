@@ -35,6 +35,7 @@ but changing it would require tearing down and recreating all resources, so it s
 | `gymlaunch-asana-agency-board-deep-sync` | Once daily | `src/sync/asana/deep/` |
 | `gymlaunch-sync-agency-board-to-hubspot` | Every hour, :10 past | `src/sync/hubspot/` |
 | `gymlaunch-mb-capacity-sheet-sync` | 8am, 12pm, 4pm, 8pm EDT | `src/sync/sheets/` |
+| `gymlaunch-sms-interceptor` | HTTP webhook (API Gateway) | `src/sms/interceptor/` |
 
 All functions run in the VPC (subnets `subnet-a085c381`, `subnet-3d566b33`) so they can reach RDS.  
 All share IAM role `gymlaunch-slack-sync` (role named after first Lambda — same naming quirk as stack).  
@@ -48,6 +49,7 @@ Permissions boundary: `gymlaunch-lambda-boundary`.
 /aws/lambda/gymlaunch-asana-agency-board-deep-sync
 /aws/lambda/gymlaunch-sync-agency-board-to-hubspot
 /aws/lambda/gymlaunch-mb-capacity-sheet-sync
+/aws/lambda/gymlaunch-sms-interceptor
 ```
 
 Retention: 30 days (set by deploy script).
@@ -65,6 +67,8 @@ All secrets are in `us-east-1`.
 | `gymlaunch/asana/token` | `token` | `gymlaunch-asana-sync`, `gymlaunch-asana-deep-sync` |
 | `gymlaunch/hubspot/token` | `token` | `gymlaunch-hubspot-sync` |
 | `gymlaunch/google/service_account` | _(raw JSON)_ | `gymlaunch-mb-capacity-sheet-sync` |
+| `gymlaunch/twilio/auth_token` | `auth_token` | `gymlaunch-sms-interceptor` |
+| `gymlaunch/twilio/octopods_webhook_url` | `url` | `gymlaunch-sms-interceptor` |
 
 The Google service account JSON is base64-encoded by deploy.sh and passed as
 `GOOGLE_SERVICE_ACCOUNT_B64`. It must have Editor access to the Google Sheet.
@@ -88,6 +92,7 @@ The Google service account JSON is base64-encoded by deploy.sh and passed as
 | `db/migrations/003_asana_schema.sql` | Asana tables (`asana_task`, `asana_user`, `asana_agency_board_task`) |
 | `db/migrations/004_staff_capacity.sql` | `agency_staff_capacity` table, seeds media buyers, creates `staff_availability` view |
 | `db/migrations/005_hubspot_schema.sql` | `account_manager_hubspot_map` table |
+| `db/migrations/006_sms_schema.sql` | `sms_inbound_message`, `sms_delivery_event` tables |
 
 ### Key Tables
 
@@ -98,6 +103,8 @@ The Google service account JSON is base64-encoded by deploy.sh and passed as
 | `asana_agency_board_task` | Denormalized agency board rows with custom fields |
 | `agency_staff_capacity` | Media buyer names + capacity limits |
 | `account_manager_hubspot_map` | AM name → HubSpot company owner ID |
+| `sms_inbound_message` | One row per inbound Twilio SMS — body, opt-out detection, HubSpot update outcome |
+| `sms_delivery_event` | One row per Twilio StatusCallback — delivery failures, HubSpot suppression outcome |
 
 ### Key Views
 
@@ -159,6 +166,52 @@ How to add new HubSpot fields: `src/sync/hubspot/how_to_update.txt`
 The deploy user has `ExplicitDenyDangerous` which blocks `lambda:DeleteFunction`.
 This means renaming a Lambda in the template leaves the old one orphaned — it must be
 deleted manually from the Lambda console.
+
+---
+
+## SMS Infrastructure
+
+### API Gateway
+
+**Stack resource:** `SmsApi` (HTTP API, `$default` stage)
+**Base URL:** Retrieved from CloudFormation output `SmsApiUrl` after first deploy.
+
+| Route | Purpose |
+|---|---|
+| `POST /sms/inbound` | Twilio inbound message webhook |
+| `POST /sms/status` | Twilio StatusCallback (delivery events) |
+
+### gymlaunch-sms-interceptor
+
+Validates the Twilio HMAC-SHA1 signature on every request, writes to RDS, runs opt-out /
+delivery-failure logic, then forwards the raw body to Octopods.
+
+**Opt-out handling** (`/sms/inbound`): if the message body exactly matches a CTIA keyword
+(STOP, STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT), the Lambda searches HubSpot for the
+sender's phone number (mobilephone first, phone as fallback, multiple format variants in
+one API call) and sets `sms_opted_out = true` on the contact.
+
+**Delivery failure handling** (`/sms/status`): if `ErrorCode` is in `{30006, 30007, 30008}`,
+the Lambda finds the recipient's HubSpot contact and sets `sms_deliverable = false` plus
+`sms_ineligible_reason` to the mapped reason string.
+
+**HubSpot properties required** (must be created manually in portal 43776308):
+
+| Property | Type | Set by |
+|---|---|---|
+| `sms_opted_out` | Checkbox (boolean) | Opt-out keyword receipt |
+| `sms_deliverable` | Checkbox (boolean) | Hard delivery failure |
+| `sms_ineligible_reason` | Single-line text | Hard delivery failure |
+
+### Post-deploy Twilio configuration
+
+After first deploy, retrieve the base URL from the `SmsApiUrl` CloudFormation output and:
+
+1. In Twilio console → Messaging Services → each of your 3 services:
+   - Set **Inbound webhook URL** to `{SmsApiUrl}/sms/inbound`, method POST
+2. Optionally (recommended for Phase 1 delivery visibility):
+   - On outbound sends, pass `status_callback="{SmsApiUrl}/sms/status"` in the Twilio API call
+   - Or set it in the Messaging Service settings if Twilio exposes that option
 
 ---
 

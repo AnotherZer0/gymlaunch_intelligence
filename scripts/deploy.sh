@@ -31,6 +31,15 @@ GOOGLE_SERVICE_ACCOUNT_B64=$(aws secretsmanager get-secret-value \
   --query SecretString --output text \
   | python3 -c "import sys,base64; print(base64.b64encode(sys.stdin.read().encode()).decode())")
 
+TWILIO_AUTH_TOKEN=$(aws secretsmanager get-secret-value \
+  --secret-id gymlaunch/twilio/auth_token \
+  --query SecretString --output text \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['auth_token'])")
+
+OCTOPODS_WEBHOOK_URLS=$(aws secretsmanager get-secret-value \
+  --secret-id gymlaunch/twilio/octopods_webhook_urls \
+  --query SecretString --output text)
+
 echo "Building..."
 sam build
 
@@ -48,7 +57,9 @@ sam deploy \
     "AsanaToken=${ASANA_TOKEN}" \
     "HubspotToken=${HUBSPOT_TOKEN}" \
     "GoogleServiceAccountB64=${GOOGLE_SERVICE_ACCOUNT_B64}" \
-    "GoogleSheetId=1xp4H9SUHHNgFu9PB_fchFpn8c1JwrF-7u74I3qLe5KY"
+    "GoogleSheetId=1xp4H9SUHHNgFu9PB_fchFpn8c1JwrF-7u74I3qLe5KY" \
+    "TwilioAuthToken=${TWILIO_AUTH_TOKEN}" \
+    "OctopodWebhookUrls=${OCTOPODS_WEBHOOK_URLS}"
 
 echo "Setting log retention..."
 aws logs put-retention-policy \
@@ -65,6 +76,9 @@ aws logs put-retention-policy \
   --retention-in-days 30
 aws logs put-retention-policy \
   --log-group-name /aws/lambda/gymlaunch-mb-capacity-sheet-sync \
+  --retention-in-days 30
+aws logs put-retention-policy \
+  --log-group-name /aws/lambda/gymlaunch-sms-interceptor \
   --retention-in-days 30
 
 echo "Done."
