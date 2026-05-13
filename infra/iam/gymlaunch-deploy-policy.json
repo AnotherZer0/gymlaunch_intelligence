@@ -18,15 +18,32 @@
       "Resource": "arn:aws:lambda:us-east-1:321763729286:function:gymlaunch-*"
     },
     {
-      "Sid": "LambdaAddPermissionEventBridge",
+      "Sid": "LambdaAddPermissionForTriggers",
       "Effect": "Allow",
       "Action": "lambda:AddPermission",
       "Resource": "arn:aws:lambda:us-east-1:321763729286:function:gymlaunch-*",
       "Condition": {
         "StringEquals": {
-          "lambda:Principal": "events.amazonaws.com"
+          "lambda:Principal": [
+            "events.amazonaws.com",
+            "apigateway.amazonaws.com"
+          ]
         }
       }
+    },
+    {
+      "Sid": "ApiGatewayDeploy",
+      "Effect": "Allow",
+      "Action": [
+        "apigateway:GET",
+        "apigateway:POST",
+        "apigateway:PUT",
+        "apigateway:PATCH"
+      ],
+      "Resource": [
+        "arn:aws:apigateway:us-east-1::/apis",
+        "arn:aws:apigateway:us-east-1::/apis/*"
+      ]
     },
     {
       "Sid": "EventBridgeSchedule",
