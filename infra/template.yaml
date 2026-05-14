@@ -38,6 +38,9 @@ Parameters:
   OctopodWebhookUrls:
     Type: String
     NoEcho: true
+  TwilioAccountSid:
+    Type: String
+    NoEcho: true
 
 Globals:
   Function:
@@ -188,6 +191,7 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: $default
+      Name: gymlaunch-intelligence
 
   SmsInterceptorFunction:
     Type: AWS::Serverless::Function
@@ -225,6 +229,26 @@ Resources:
             Path: /sms/status
             Method: POST
 
+  PhoneValidatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-phone-validator
+      CodeUri: ../src/phone/validator/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Timeout: 29  # API Gateway HTTP API max integration timeout
+      Environment:
+        Variables:
+          TWILIO_ACCOUNT_SID: !Ref TwilioAccountSid
+          TWILIO_AUTH_TOKEN: !Ref TwilioAuthToken
+      Events:
+        ValidatePhone:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SmsApi
+            Path: /phone/validate
+            Method: POST
+
 Outputs:
   SlackFunctionArn:
     Value: !GetAtt SlackSyncFunction.Arn
@@ -238,6 +262,11 @@ Outputs:
     Value: !GetAtt SheetsSyncFunction.Arn
   SmsInterceptorFunctionArn:
     Value: !GetAtt SmsInterceptorFunction.Arn
+  PhoneValidatorFunctionArn:
+    Value: !GetAtt PhoneValidatorFunction.Arn
+  PhoneValidatorUrl:
+    Value: !Sub "https://${SmsApi}.execute-api.${AWS::Region}.amazonaws.com/phone/validate"
+    Description: "Phone normalization + Twilio Lookup endpoint for HubSpot code action"
   SmsApiUrl:
     Value: !Sub "https://${SmsApi}.execute-api.${AWS::Region}.amazonaws.com"
     Description: "Base URL for Twilio webhooks — append /sms/inbound and /sms/status"

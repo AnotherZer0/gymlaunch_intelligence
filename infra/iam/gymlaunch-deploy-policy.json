@@ -20,7 +20,10 @@
     {
       "Sid": "LambdaAddPermissionForTriggers",
       "Effect": "Allow",
-      "Action": "lambda:AddPermission",
+      "Action": [
+        "lambda:AddPermission",
+        "lambda:RemovePermission"
+      ],
       "Resource": "arn:aws:lambda:us-east-1:321763729286:function:gymlaunch-*",
       "Condition": {
         "StringEquals": {
@@ -38,7 +41,8 @@
         "apigateway:GET",
         "apigateway:POST",
         "apigateway:PUT",
-        "apigateway:PATCH"
+        "apigateway:PATCH",
+        "apigateway:TagResource"
       ],
       "Resource": [
         "arn:aws:apigateway:us-east-1::/apis",

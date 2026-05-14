@@ -157,11 +157,12 @@ def _channel_for_number(to_number: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _build_octopods_url_map() -> dict:
-    raw = os.environ.get("OCTOPODS_WEBHOOK_URLS", "{}")
+    raw = os.environ.get("OCTOPODS_WEBHOOK_URLS", "e30=")  # e30= is base64 for {}
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        print(f"ERROR: OCTOPODS_WEBHOOK_URLS is not valid JSON: {raw[:100]}")
+        decoded = base64.b64decode(raw).decode()
+        return json.loads(decoded)
+    except Exception as e:
+        print(f"ERROR: failed to decode OCTOPODS_WEBHOOK_URLS: {e}")
         return {}
 
 
@@ -187,6 +188,13 @@ def _get_db():
 # Twilio signature validation
 # ---------------------------------------------------------------------------
 
+def _compute_twilio_signature(auth_token: str, url: str, params: dict) -> str:
+    """Compute the HMAC-SHA1 Twilio signature for the given URL and POST params."""
+    s = url + "".join(k + params[k] for k in sorted(params))
+    mac = _hmac.new(auth_token.encode(), s.encode(), hashlib.sha1)
+    return base64.b64encode(mac.digest()).decode()
+
+
 def _validate_twilio_signature(auth_token: str, signature: str, url: str, params: dict) -> bool:
     """
     HMAC-SHA1 per Twilio spec:
@@ -195,9 +203,7 @@ def _validate_twilio_signature(auth_token: str, signature: str, url: str, params
       3. Sign with HMAC-SHA1 using the auth token, base64-encode
       4. Compare in constant time against the X-Twilio-Signature header
     """
-    s = url + "".join(k + params[k] for k in sorted(params))
-    mac = _hmac.new(auth_token.encode(), s.encode(), hashlib.sha1)
-    return _hmac.compare_digest(base64.b64encode(mac.digest()).decode(), signature)
+    return _hmac.compare_digest(_compute_twilio_signature(auth_token, url, params), signature)
 
 
 def _parse_event(event: dict) -> tuple[str, dict, str]:
@@ -210,7 +216,7 @@ def _parse_event(event: dict) -> tuple[str, dict, str]:
     if event.get("isBase64Encoded"):
         raw = base64.b64decode(raw).decode()
 
-    params = dict(urllib.parse.parse_qsl(raw))
+    params = dict(urllib.parse.parse_qsl(raw, keep_blank_values=True))
     return url, params, raw
 
 
@@ -424,7 +430,7 @@ def _apply_opt_in(contact_id: str, channel: str, to_number: str) -> str:
 # Octopods forwarding
 # ---------------------------------------------------------------------------
 
-def _forward_to_octopods(raw_body: str, content_type: str, twilio_sig: str, our_number: str) -> int | None:
+def _forward_to_octopods(raw_body: str, content_type: str, params: dict, our_number: str) -> int | None:
     """
     POST the raw Twilio body to the Octopods URL for the given Twilio number.
     Returns HTTP status code or None if the number isn't mapped or the request fails.
@@ -433,11 +439,9 @@ def _forward_to_octopods(raw_body: str, content_type: str, twilio_sig: str, our_
       - For inbound messages: pass the `To` field (our number received the message)
       - For status callbacks: pass the `From` field (our number sent the message)
 
-    The original X-Twilio-Signature is passed through. Note: because the request
-    URL changed (ours → Octopods'), any signature validation Octopods performs
-    against their own URL will fail. In practice Octopods does not appear to
-    validate signatures on forwarded traffic. If they start rejecting, remove
-    the header here.
+    The X-Twilio-Signature is re-computed for the Octopods URL. The signature
+    Twilio sent was bound to our URL — Octopods validates against their own URL,
+    so we must re-sign using the same auth token before forwarding.
 
     Phase 3 note: once we replace Octopods, this function and _OCTOPODS_URL_MAP
     go away entirely — all traffic routes through our own outbound Lambda instead.
@@ -447,12 +451,14 @@ def _forward_to_octopods(raw_body: str, content_type: str, twilio_sig: str, our_
         print(f"No Octopods URL configured for {our_number} — skipping forward")
         return None
     try:
+        auth_token = os.environ["TWILIO_AUTH_TOKEN"]
+        signature  = _compute_twilio_signature(auth_token, url, params)
         resp = requests.post(
             url,
             data=raw_body,
             headers={
                 "Content-Type":       content_type,
-                "X-Twilio-Signature": twilio_sig,
+                "X-Twilio-Signature": signature,
             },
             timeout=10,
         )
@@ -472,7 +478,13 @@ def _handle_inbound(event: dict, db) -> dict:
     sig = headers.get("x-twilio-signature", "")
 
     if not _validate_twilio_signature(os.environ["TWILIO_AUTH_TOKEN"], sig, url, params):
-        print(f"Signature validation failed — possible spoofed request to {url}")
+        print(
+            f"Signature validation failed — url={url} "
+            f"sig_received={sig[:12]}... "
+            f"sig_computed={_compute_twilio_signature(os.environ['TWILIO_AUTH_TOKEN'], url, params)[:12]}... "
+            f"param_keys={sorted(params.keys())} "
+            f"body_raw={params.get('Body','')!r}"
+        )
         return {"statusCode": 403, "body": "Forbidden"}
 
     message_sid   = params.get("MessageSid", "")
@@ -507,7 +519,7 @@ def _handle_inbound(event: dict, db) -> dict:
     octopods_code = _forward_to_octopods(
         raw_body,
         headers.get("content-type", "application/x-www-form-urlencoded"),
-        sig,
+        params=params,
         our_number=to_number,
     )
 

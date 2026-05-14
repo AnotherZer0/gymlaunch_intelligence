@@ -38,7 +38,13 @@ TWILIO_AUTH_TOKEN=$(aws secretsmanager get-secret-value \
 
 OCTOPODS_WEBHOOK_URLS=$(aws secretsmanager get-secret-value \
   --secret-id gymlaunch/twilio/octopods_webhook_urls \
-  --query SecretString --output text)
+  --query SecretString --output text \
+  | base64 -w 0)
+
+TWILIO_ACCOUNT_SID=$(aws secretsmanager get-secret-value \
+  --secret-id gymlaunch/twilio/account_sid \
+  --query SecretString --output text \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['account_sid'])")
 
 echo "Building..."
 sam build
@@ -59,7 +65,8 @@ sam deploy \
     "GoogleServiceAccountB64=${GOOGLE_SERVICE_ACCOUNT_B64}" \
     "GoogleSheetId=1xp4H9SUHHNgFu9PB_fchFpn8c1JwrF-7u74I3qLe5KY" \
     "TwilioAuthToken=${TWILIO_AUTH_TOKEN}" \
-    "OctopodWebhookUrls=${OCTOPODS_WEBHOOK_URLS}"
+    "OctopodWebhookUrls=${OCTOPODS_WEBHOOK_URLS}" \
+    "TwilioAccountSid=${TWILIO_ACCOUNT_SID}"
 
 echo "Setting log retention..."
 aws logs put-retention-policy \
@@ -79,6 +86,9 @@ aws logs put-retention-policy \
   --retention-in-days 30
 aws logs put-retention-policy \
   --log-group-name /aws/lambda/gymlaunch-sms-interceptor \
+  --retention-in-days 30
+aws logs put-retention-policy \
+  --log-group-name /aws/lambda/gymlaunch-phone-validator \
   --retention-in-days 30
 
 echo "Done."
