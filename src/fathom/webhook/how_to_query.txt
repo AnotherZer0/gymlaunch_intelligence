@@ -1,0 +1,273 @@
+Fathom Call Transcripts — How It Works & How to Query
+=======================================================
+
+WHAT THIS IS
+------------
+Fathom is an AI meeting recorder. After every recorded call it fires a webhook
+containing the transcript, meeting metadata, and participant info. We intercept
+that webhook (via Zapier), store everything in RDS, and use it as part of the
+AI brain — the unified view of every interaction we've ever had with a customer.
+
+The data lands in two tables: fathom_call and fathom_call_invitee.
+The reason there are two tables is explained in full below.
+
+
+WHY TWO TABLES?
+---------------
+At first glance it seems like you could store everything in one row. The webhook
+payload is mostly flat, so why not just dump it all into a single fathom_call table?
+
+The problem is invitees.
+
+A call can have more than one invitee. Even if that's rare today, the schema has
+to handle it. If you store invitees in the main call row — as a comma-separated
+string, or a JSON blob, or just the one email — you lose the ability to query
+cleanly. You cannot write:
+
+    WHERE invitee_email = 'john@example.com'
+
+...if the emails are buried inside a JSON array or concatenated into a string.
+The database can't index on that. Every lookup becomes a slow full-table scan
+with string pattern matching.
+
+The normalized design puts each invitee in their own row in fathom_call_invitee,
+with a foreign key back to fathom_call. Now you can:
+
+  - Index on email (fast lookups even at millions of rows)
+  - Ask "show me every call that involved this email address" with a simple JOIN
+  - Add more invitees to a call later without touching the call row itself
+  - Eventually join fathom_call_invitee to hubspot_contact on email to get the
+    full customer profile alongside every transcript (this is the AI brain query)
+
+The cost is one JOIN when querying. The benefit is everything else.
+
+
+HOW WEBHOOKS ARRIVE
+--------------------
+Flow:
+
+  Fathom records a call
+       ↓
+  Fathom fires a webhook to a Zapier Catch Hook URL
+       ↓
+  Zapier re-fires the payload to:
+  POST https://{api-gateway-id}.execute-api.us-east-1.amazonaws.com/fathom/webhook
+       ↓
+  gymlaunch-fathom-webhook Lambda runs
+       ↓
+  Validates X-Webhook-Secret header (constant-time compare — returns 403 if wrong)
+       ↓
+  Parses the JSON body
+       ↓
+  Upserts one row into fathom_call (keyed on fathom_id — safe to re-send)
+       ↓
+  Upserts one row into fathom_call_invitee for each invitee found
+       ↓
+  Returns 200
+
+The upsert on fathom_id means if Zapier retries a failed delivery, or if the
+same call somehow gets sent twice, you don't get duplicate rows. The second
+arrival just overwrites the first with the same data.
+
+The X-Webhook-Secret header must match the value stored in:
+  gymlaunch/fathom/Fathom-Webhook-Secret  (key: secret)
+
+Zapier is configured to send this header on every re-fire. If you ever rotate
+the secret, update it in Secrets Manager and redeploy — then update the header
+value in the Zapier webhook action to match.
+
+
+THE TABLES
+----------
+fathom_call
+  One row per recorded call.
+  Primary key: id (internal bigint)
+  Natural key: fathom_id (the string Fathom assigns, e.g. "77446064")
+
+  Notable columns:
+    fathom_user_name / fathom_user_email   The GymLaunch team member on the call
+    fathom_user_team                       Which team they're on (e.g. "Coaching")
+    meeting_scheduled_start_time           When the call was supposed to start (UTC)
+    recording_duration_in_minutes          How long the call actually ran (numeric)
+    transcript_plaintext                   The full transcript as plain text
+    summary                                AI-generated summary — NULL until filled in
+    recording_url                          Direct link to the recording
+    recording_share_url                    Shareable link (what you'd send a client)
+    raw_payload                            The complete original webhook payload (JSONB)
+    received_at                            When our Lambda stored it
+
+fathom_call_invitee
+  One row per invitee per call.
+  Foreign key: call_id → fathom_call.id (cascades on delete)
+  Unique constraint: (call_id, email) — one row per person per call
+
+  Columns:
+    name          Invitee's display name
+    email         Their email address — this is the join key for AI brain queries
+    is_external   True if they're outside GymLaunch (i.e. a client or prospect)
+    domain_name   Their email domain (e.g. "clientgym.com")
+
+  The primary invitee comes from the flat fields in the webhook payload
+  (meeting_invitees_email, meeting_invitees_name, meeting_invitees_is_external).
+  Additional invitees come from the meeting_invitees array if present (usually empty).
+
+
+QUERYING IN PGADMIN4
+---------------------
+Connect to gymlaunch_intelligence, open the Query Tool, paste and run.
+
+
+See all calls, most recent first:
+
+    SELECT
+        fathom_id,
+        meeting_title,
+        fathom_user_name,
+        fathom_user_team,
+        meeting_scheduled_start_time,
+        recording_duration_in_minutes,
+        summary IS NOT NULL AS has_summary
+    FROM fathom_call
+    ORDER BY meeting_scheduled_start_time DESC;
+
+
+See all calls that haven't been summarised yet:
+
+    SELECT
+        fathom_id,
+        meeting_title,
+        fathom_user_name,
+        meeting_scheduled_start_time
+    FROM fathom_call
+    WHERE summary IS NULL
+    ORDER BY meeting_scheduled_start_time DESC;
+
+
+Look up a single call by fathom_id:
+
+    SELECT * FROM fathom_call WHERE fathom_id = '77446064';
+
+
+See who was on a call:
+
+    SELECT fci.name, fci.email, fci.is_external, fci.domain_name
+    FROM fathom_call_invitee fci
+    JOIN fathom_call fc ON fc.id = fci.call_id
+    WHERE fc.fathom_id = '77446064';
+
+
+THE CORE AI BRAIN QUERY — all calls involving a customer email
+--------------------------------------------------------------
+This is the main reason the invitee table exists. Given any email address,
+get every call that person was ever on, with the transcript and summary:
+
+    SELECT
+        fc.fathom_id,
+        fc.meeting_title,
+        fc.fathom_user_name,
+        fc.fathom_user_team,
+        fc.meeting_scheduled_start_time,
+        fc.recording_duration_in_minutes,
+        fc.transcript_plaintext,
+        fc.summary,
+        fc.recording_share_url
+    FROM fathom_call fc
+    JOIN fathom_call_invitee fci ON fci.call_id = fc.id
+    WHERE fci.email = 'john@example.com'
+    ORDER BY fc.meeting_scheduled_start_time DESC;
+
+Replace john@example.com with any email. The index on fathom_call_invitee.email
+makes this fast regardless of how many calls are in the table.
+
+
+All calls with external invitees from a specific company domain:
+
+    SELECT
+        fc.meeting_title,
+        fc.fathom_user_name,
+        fc.meeting_scheduled_start_time,
+        fci.name AS client_name,
+        fci.email AS client_email
+    FROM fathom_call fc
+    JOIN fathom_call_invitee fci ON fci.call_id = fc.id
+    WHERE fci.domain_name = 'clientgym.com'
+      AND fci.is_external = true
+    ORDER BY fc.meeting_scheduled_start_time DESC;
+
+
+All calls by a specific team member in the last 30 days:
+
+    SELECT
+        fc.fathom_id,
+        fc.meeting_title,
+        fc.meeting_scheduled_start_time,
+        fc.recording_duration_in_minutes,
+        fci.name AS invitee_name,
+        fci.email AS invitee_email
+    FROM fathom_call fc
+    JOIN fathom_call_invitee fci ON fci.call_id = fc.id
+    WHERE fc.fathom_user_name = 'Rodrigo Busby'
+      AND fc.meeting_scheduled_start_time > now() - interval '30 days'
+    ORDER BY fc.meeting_scheduled_start_time DESC;
+
+
+All calls by team (coaching vs. other):
+
+    SELECT
+        fathom_user_team,
+        COUNT(*) AS call_count,
+        ROUND(AVG(recording_duration_in_minutes), 1) AS avg_duration_mins
+    FROM fathom_call
+    WHERE meeting_scheduled_start_time > now() - interval '90 days'
+    GROUP BY fathom_user_team
+    ORDER BY call_count DESC;
+
+
+MANUALLY UPDATING THE SUMMARY FIELD
+-------------------------------------
+The summary column is filled by an automated pipeline (n8n → Claude API → write back).
+If you need to manually set or correct a summary in pgAdmin4:
+
+    UPDATE fathom_call
+    SET summary = 'Discussed onboarding timeline. Client is ready to go live next week.
+    Action items: send contract by Thursday, schedule kick-off for Friday.'
+    WHERE fathom_id = '77446064';
+
+To clear a summary so the automated pipeline re-processes it:
+
+    UPDATE fathom_call SET summary = NULL WHERE fathom_id = '77446064';
+
+To clear all summaries and reprocess everything (careful — this triggers the
+pipeline to re-summarise every call):
+
+    UPDATE fathom_call SET summary = NULL;
+
+
+HOW THE SUMMARY PIPELINE WORKS (once built)
+--------------------------------------------
+1. n8n polls fathom_call for rows where summary IS NULL
+2. For each row, n8n sends transcript_plaintext to Claude API
+3. Claude returns a ~10 second summary of the call
+4. n8n calls PATCH /fathom/summary with the fathom_id and summary text
+5. The Lambda writes the summary back to the row
+
+This means the summary column starts NULL on every new call and gets filled
+within minutes of the pipeline running. The raw transcript is always preserved
+regardless — the summary is additive, not a replacement.
+
+
+FINDING THE WEBHOOK URL AFTER DEPLOY
+--------------------------------------
+    aws cloudformation describe-stacks \
+      --stack-name gymlaunch-slack-sync \
+      --query "Stacks[0].Outputs[?OutputKey=='FathomWebhookUrl'].OutputValue" \
+      --output text
+
+Point this URL at the Zapier webhook action. Also set the header:
+  X-Webhook-Secret: <value from gymlaunch/fathom/Fathom-Webhook-Secret>
+
+
+SECRETS USED BY THIS LAMBDA
+-----------------------------
+gymlaunch/fathom/Fathom-Webhook-Secret   Shared secret validated on every inbound request
+gymlaunch/db/gls_writer                  RDS password (shared with all Lambdas)

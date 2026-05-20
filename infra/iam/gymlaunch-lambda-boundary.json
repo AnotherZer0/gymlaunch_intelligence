@@ -19,6 +19,12 @@
       ]
     },
     {
+      "Sid": "AllowSES",
+      "Effect": "Allow",
+      "Action": "ses:SendRawEmail",
+      "Resource": "*"
+    },
+    {
       "Sid": "AllowVPCNetworkInterface",
       "Effect": "Allow",
       "Action": [

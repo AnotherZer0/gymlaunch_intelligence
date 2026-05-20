@@ -46,6 +46,21 @@ TWILIO_ACCOUNT_SID=$(aws secretsmanager get-secret-value \
   --query SecretString --output text \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['account_sid'])")
 
+FATHOM_WEBHOOK_SECRET=$(aws secretsmanager get-secret-value \
+  --secret-id gymlaunch/fathom/Fathom-Webhook-Secret \
+  --query SecretString --output text \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['secret'])")
+
+# JSON object: {"acct_1xxx": "sk_live_xxx", ...} — base64 encoded to survive param quoting
+STRIPE_API_KEYS_B64=$(aws secretsmanager get-secret-value \
+  --secret-id gymlaunch/stripe/api_keys \
+  --query SecretString --output text \
+  | base64 -w 0)
+
+# From address for the daily finance report email (domain must be verified in SES us-east-1)
+SES_FROM_ADDRESS="reports@gymlaunch.com"
+SES_TO_ADDRESS="ap@gymlaunchsecrets.com"
+
 echo "Building..."
 sam build
 
@@ -66,29 +81,25 @@ sam deploy \
     "GoogleSheetId=1xp4H9SUHHNgFu9PB_fchFpn8c1JwrF-7u74I3qLe5KY" \
     "TwilioAuthToken=${TWILIO_AUTH_TOKEN}" \
     "OctopodWebhookUrls=${OCTOPODS_WEBHOOK_URLS}" \
-    "TwilioAccountSid=${TWILIO_ACCOUNT_SID}"
+    "TwilioAccountSid=${TWILIO_ACCOUNT_SID}" \
+    "FathomWebhookSecret=${FATHOM_WEBHOOK_SECRET}" \
+    "StripeApiKeysB64=${STRIPE_API_KEYS_B64}" \
+    "SesFromAddress=${SES_FROM_ADDRESS}" \
+    "SesToAddress=${SES_TO_ADDRESS}"
 
 echo "Setting log retention..."
-aws logs put-retention-policy \
-  --log-group-name /aws/lambda/gymlaunch-slack-sync \
-  --retention-in-days 30
-aws logs put-retention-policy \
-  --log-group-name /aws/lambda/gymlaunch-asana-agency-board-sync \
-  --retention-in-days 30
-aws logs put-retention-policy \
-  --log-group-name /aws/lambda/gymlaunch-asana-agency-board-deep-sync \
-  --retention-in-days 30
-aws logs put-retention-policy \
-  --log-group-name /aws/lambda/gymlaunch-sync-agency-board-to-hubspot \
-  --retention-in-days 30
-aws logs put-retention-policy \
-  --log-group-name /aws/lambda/gymlaunch-mb-capacity-sheet-sync \
-  --retention-in-days 30
-aws logs put-retention-policy \
-  --log-group-name /aws/lambda/gymlaunch-sms-interceptor \
-  --retention-in-days 30
-aws logs put-retention-policy \
-  --log-group-name /aws/lambda/gymlaunch-phone-validator \
-  --retention-in-days 30
+set_retention() {
+  aws logs create-log-group --log-group-name "$1" 2>/dev/null || true
+  aws logs put-retention-policy --log-group-name "$1" --retention-in-days 30
+}
+set_retention /aws/lambda/gymlaunch-slack-sync
+set_retention /aws/lambda/gymlaunch-asana-agency-board-sync
+set_retention /aws/lambda/gymlaunch-asana-agency-board-deep-sync
+set_retention /aws/lambda/gymlaunch-sync-agency-board-to-hubspot
+set_retention /aws/lambda/gymlaunch-mb-capacity-sheet-sync
+set_retention /aws/lambda/gymlaunch-sms-interceptor
+set_retention /aws/lambda/gymlaunch-phone-validator
+set_retention /aws/lambda/gymlaunch-fathom-webhook
+set_retention /aws/lambda/gymlaunch-stripe-finance-report
 
 echo "Done."

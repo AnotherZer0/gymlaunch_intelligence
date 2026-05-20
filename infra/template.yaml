@@ -41,6 +41,16 @@ Parameters:
   TwilioAccountSid:
     Type: String
     NoEcho: true
+  FathomWebhookSecret:
+    Type: String
+    NoEcho: true
+  StripeApiKeysB64:
+    Type: String
+    NoEcho: true
+  SesFromAddress:
+    Type: String
+  SesToAddress:
+    Type: String
 
 Globals:
   Function:
@@ -249,6 +259,54 @@ Resources:
             Path: /phone/validate
             Method: POST
 
+  FathomWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-fathom-webhook
+      CodeUri: ../src/fathom/webhook/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Timeout: 29  # API Gateway HTTP API max integration timeout
+      Environment:
+        Variables:
+          WEBHOOK_SECRET: !Ref FathomWebhookSecret
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        FathomWebhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SmsApi
+            Path: /fathom/webhook
+            Method: POST
+
+  StripeFinanceReportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-stripe-finance-report
+      CodeUri: ../src/sync/stripe/finance_report/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          STRIPE_API_KEYS_B64: !Ref StripeApiKeysB64
+          SES_FROM_ADDRESS: !Ref SesFromAddress
+          SES_TO_ADDRESS: !Ref SesToAddress
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        WeekdayReport:
+          Type: Schedule
+          Properties:
+            # 15:00 UTC = 10am CDT. Shifts to 9am in winter CST — adjust to cron(0 16 ...) if needed.
+            Schedule: cron(0 15 ? * MON-FRI *)
+            Name: gymlaunch-stripe-finance-report-weekday
+            Enabled: true
+
 Outputs:
   SlackFunctionArn:
     Value: !GetAtt SlackSyncFunction.Arn
@@ -264,6 +322,13 @@ Outputs:
     Value: !GetAtt SmsInterceptorFunction.Arn
   PhoneValidatorFunctionArn:
     Value: !GetAtt PhoneValidatorFunction.Arn
+  StripeFinanceReportFunctionArn:
+    Value: !GetAtt StripeFinanceReportFunction.Arn
+  FathomWebhookFunctionArn:
+    Value: !GetAtt FathomWebhookFunction.Arn
+  FathomWebhookUrl:
+    Value: !Sub "https://${SmsApi}.execute-api.${AWS::Region}.amazonaws.com/fathom/webhook"
+    Description: "Fathom call transcript webhook — point Zapier here"
   PhoneValidatorUrl:
     Value: !Sub "https://${SmsApi}.execute-api.${AWS::Region}.amazonaws.com/phone/validate"
     Description: "Phone normalization + Twilio Lookup endpoint for HubSpot code action"

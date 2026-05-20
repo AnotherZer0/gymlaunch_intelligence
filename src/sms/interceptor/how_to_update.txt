@@ -70,14 +70,32 @@ HOW TO ADD A NEW TWILIO NUMBER (same channel)
 ---------------------------------------------
 Example: adding +12135001234 to the Marketing channel.
 
-1. Open infra/template.yaml
-2. Find TWILIO_NUMBER_CHANNELS under SmsInterceptorFunction → Environment → Variables
-3. Add the number to the Marketing array:
+1. Get the Octopods webhook URL for the new number from Octopods app settings.
+   Add it to the gymlaunch/twilio/octopods_webhook_urls secret in Secrets Manager:
+
+     aws secretsmanager get-secret-value \
+       --secret-id gymlaunch/twilio/octopods_webhook_urls \
+       --query SecretString --output text | base64 -d
+     # Note the current JSON, add the new entry, then update:
+     aws secretsmanager put-secret-value \
+       --secret-id gymlaunch/twilio/octopods_webhook_urls \
+       --secret-string '{ ...existing entries..., "+12135001234": "https://app.octopods.io/channels/twilio/hubspot/notification/YOURTOKEN" }'
+
+   The secret value is raw JSON (not base64) — deploy.sh handles the encoding.
+
+2. Open infra/template.yaml.
+   Find TWILIO_NUMBER_CHANNELS under SmsInterceptorFunction → Environment → Variables.
+   Add the number to the appropriate channel array:
      TWILIO_NUMBER_CHANNELS: '{"Marketing": ["+12135661157", "+12135613526", "+12135795481", "+12135001234"]}'
-4. Deploy:
+
+3. Deploy:
      bash scripts/deploy.sh
-5. In Twilio console: set the new number's Messaging Service inbound webhook URL to
-   the SmsApiUrl from CloudFormation outputs + /sms/inbound
+
+4. In the Twilio console: assign the new number to your Messaging Service
+   (or set its inbound webhook URL directly to {SmsApiUrl}/sms/inbound, method POST).
+
+If you skip step 1, the Lambda will still process opt-outs and write to RDS, but
+won't forward messages to Octopods — HubSpot Conversations will be silent for that number.
 
 
 HOW TO ADD A NEW CHANNEL
@@ -105,6 +123,36 @@ Step 4 — Deploy:
 
 Step 5 — Update Twilio:
   Point the new number's inbound webhook at {SmsApiUrl}/sms/inbound
+
+
+HOW TWILIO SIGNATURE VALIDATION WORKS
+--------------------------------------
+Every request Twilio sends to our webhook includes an X-Twilio-Signature header.
+We validate it before doing anything else — invalid signatures get a 403 immediately.
+This prevents anyone who discovers the public API Gateway URL from posting fake data.
+
+The algorithm (Twilio spec):
+  1. Start with the full request URL
+     e.g. https://0809f9x39a.execute-api.us-east-1.amazonaws.com/sms/inbound
+  2. Sort all POST params alphabetically, concatenate them with no separators:
+     key1value1key2value2key3value3...
+     Blank-value params (ToCity=, ToZip=) MUST be included — Twilio signs them too.
+  3. Sign the concatenated string with HMAC-SHA1 using the Twilio auth token as the key.
+  4. Base64-encode the result.
+  5. Compare against X-Twilio-Signature in constant time (prevents timing attacks).
+
+We do the same thing when forwarding to Octopods, except we re-compute the signature
+using the Octopods URL instead of ours. The signature Twilio sent is bound to our URL —
+Octopods validates against their own URL, so we must re-sign before forwarding.
+
+Debugging a signature mismatch:
+  - CloudWatch logs print the received sig, computed sig, and param keys when validation fails.
+  - Most common cause: URL mismatch (trailing slash, HTTP vs HTTPS, wrong domain).
+  - Second most common: a POST param was dropped or double-decoded before validation.
+    Make sure you parse the raw body with keep_blank_values=True.
+  - If the Twilio auth token was rotated, update gymlaunch/twilio/auth_token in
+    Secrets Manager and redeploy — the Lambda reads it from the env var, not Secrets Manager
+    at runtime, so a secret rotation alone doesn't take effect until next deploy.
 
 
 HOW TO FIND THE API GATEWAY URL AFTER DEPLOY
