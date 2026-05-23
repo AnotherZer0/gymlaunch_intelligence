@@ -101,5 +101,6 @@ set_retention /aws/lambda/gymlaunch-sms-interceptor
 set_retention /aws/lambda/gymlaunch-phone-validator
 set_retention /aws/lambda/gymlaunch-fathom-webhook
 set_retention /aws/lambda/gymlaunch-stripe-finance-report
+set_retention /aws/lambda/gymlaunch-project-note-sync
 
 echo "Done."

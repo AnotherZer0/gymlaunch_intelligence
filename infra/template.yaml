@@ -282,6 +282,34 @@ Resources:
             Path: /fathom/webhook
             Method: POST
 
+  ProjectNoteSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-project-note-sync
+      CodeUri: ../src/sync/hubspot_project_notes/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          HUBSPOT_TOKEN: !Ref HubspotToken
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        # Logical name "NightlySync" is kept intentionally — renaming this key
+        # makes CloudFormation try to delete-and-recreate the underlying
+        # AWS::Events::Rule, which collides on the `Name:` value below.
+        # Cadence is actually every 72h now, sized to observed signal volume.
+        NightlySync:
+          Type: Schedule
+          Properties:
+            # Every 72h. Drifts off clock-time but this is a background maintenance
+            # job — no user-facing impact, so the drift is fine.
+            Schedule: rate(72 hours)
+            Name: gymlaunch-project-note-sync-nightly
+            Enabled: true
+
   StripeFinanceReportFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -324,6 +352,8 @@ Outputs:
     Value: !GetAtt PhoneValidatorFunction.Arn
   StripeFinanceReportFunctionArn:
     Value: !GetAtt StripeFinanceReportFunction.Arn
+  ProjectNoteSyncFunctionArn:
+    Value: !GetAtt ProjectNoteSyncFunction.Arn
   FathomWebhookFunctionArn:
     Value: !GetAtt FathomWebhookFunction.Arn
   FathomWebhookUrl:

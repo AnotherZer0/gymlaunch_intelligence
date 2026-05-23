@@ -38,6 +38,7 @@ but changing it would require tearing down and recreating all resources, so it s
 | `gymlaunch-sms-interceptor` | HTTP webhook (API Gateway) | `src/sms/interceptor/` |
 | `gymlaunch-phone-validator` | HTTP webhook (API Gateway) | `src/phone/validator/` |
 | `gymlaunch-stripe-finance-report` | M-F at 10am Central (15:00 UTC) | `src/sync/stripe/finance_report/` |
+| `gymlaunch-project-note-sync` | Every 72 hours | `src/sync/hubspot_project_notes/` |
 
 All functions run in the VPC (subnets `subnet-a085c381`, `subnet-3d566b33`) so they can reach RDS.  
 All share IAM role `gymlaunch-slack-sync` (role named after first Lambda — same naming quirk as stack).  
@@ -54,6 +55,7 @@ Permissions boundary: `gymlaunch-lambda-boundary`.
 /aws/lambda/gymlaunch-sms-interceptor
 /aws/lambda/gymlaunch-phone-validator
 /aws/lambda/gymlaunch-stripe-finance-report
+/aws/lambda/gymlaunch-project-note-sync
 ```
 
 Retention: 30 days (set by deploy script).
@@ -100,6 +102,8 @@ The Google service account JSON is base64-encoded by deploy.sh and passed as
 | `db/migrations/005_hubspot_schema.sql` | `account_manager_hubspot_map` table |
 | `db/migrations/006_sms_schema.sql` | `sms_inbound_message`, `sms_delivery_event` tables |
 | `db/migrations/007_stripe_schema.sql` | `stripe_payout_export` table |
+| `db/migrations/007_fathom_schema.sql` | `fathom_call`, `fathom_call_invitee` tables |
+| `db/migrations/008_project_note_sync_schema.sql` | `hubspot_project_note_sync` table |
 
 ### Key Tables
 
@@ -113,6 +117,7 @@ The Google service account JSON is base64-encoded by deploy.sh and passed as
 | `sms_inbound_message` | One row per inbound Twilio SMS — body, opt-out detection, HubSpot update outcome |
 | `sms_delivery_event` | One row per Twilio StatusCallback — delivery failures, HubSpot suppression outcome |
 | `stripe_payout_export` | One row per processed Stripe payout — prevents duplicate finance reports |
+| `hubspot_project_note_sync` | One row per (note, project) pair processed by the nightly project-note sync. Snapshot of the project's companies/contacts + per-side synced_at timestamps. |
 
 ### Key Views
 
@@ -334,6 +339,286 @@ to send to unverified recipients.
 
 Schedule fires at 15:00 UTC = 10am CDT (summer). In winter CST it fires at 9am.
 To pin to 10am year-round change the cron to `cron(0 16 ? * MON-FRI *)`.
+
+---
+
+## HubSpot Project-Note Sync
+
+**Lambda:** `gymlaunch-project-note-sync`
+**Schedule:** `rate(72 hours)` — fires every 3 days from last deploy/fire. Drifts off clock-time, but this is a background maintenance job with no user-facing impact, so the drift is fine. Sized this way because real-world signal is sparse (~11 pairs needing writes per 30 days observed in the wild).
+**Source:** `src/sync/hubspot_project_notes/`
+
+### Why it exists
+
+HubSpot doesn't fire a useful webhook when a note is created on the Projects object (`0-970`), so we can't intercept note creation in real time. Instead this Lambda runs nightly and back-fills associations so every note attached to a project is also associated with that project's companies and contacts. Once the note is associated to the company/contact, downstream activity rollups (and the future AI brain) see the note in context.
+
+### API access gotcha — read this before touching the handler
+
+The `/crm/v3/objects/0-970` list-instances endpoint (and its dated-API sibling `/crm/objects/2026-03/projects`) is gated behind a scope **not available to Private Apps** for our portal. Hitting them returns:
+
+```
+{"status":"error","message":"The scope needed for this API call isn't available for public use."}
+```
+
+This error has no `requiredScopes` array — it's not a missing-scope problem you can fix in the scope picker. It reproduces in HubSpot's own docs "Try It" widget with our token. A support ticket has been filed (correlationId `019e5159-e757-7721-818b-5f78ef50872c`).
+
+**The v4 associations endpoints work normally** — they're how we reach Project data without listing instances. That's why this Lambda is notes-first instead of projects-first.
+
+| Endpoint | Works for us? |
+|---|---|
+| `GET /crm/v3/objects/0-970` | **NO** — public-use gate |
+| `GET /crm/objects/2026-03/projects` | **NO** — same gate |
+| `POST /crm/v4/associations/0-970/companies/batch/read` | yes |
+| `POST /crm/v4/associations/0-970/contacts/batch/read` | yes |
+| `POST /crm/v4/associations/notes/0-970/batch/read` | yes |
+
+Scopes on the Private App: `projects.read`, `custom-objects-read`, plus the existing CRM-object scopes.
+
+### Algorithm
+
+1. Search notes modified at or after `now - lookback_hours` (`POST /crm/v3/objects/notes/search`, sorted ascending by `hs_lastmodifieddate`, 100 per page).
+2. For each batch, batch-read note→project associations (`POST /crm/v4/associations/notes/0-970/batch/read`). Drop notes not attached to any project.
+3. Collect unique project IDs, batch-read each project's companies and contacts (`/crm/v4/associations/0-970/companies/batch/read` and `.../contacts/batch/read`).
+4. Build candidate `(note, project)` pairs. Look up each in `hubspot_project_note_sync` — skip pairs where the snapshot matches and both sides are already marked synced.
+5. For pairs needing work, batch-read each note's CURRENT note→company and note→contact associations.
+6. Compute the desired set per note = UNION of every linked project's companies + contacts in this batch.
+7. Batch-create missing associations (`/crm/v4/associations/notes/{companies|contacts}/batch/create/default`).
+8. Upsert one state row per pair. `companies_synced_at` / `contacts_synced_at` are set to `now()` if the side is fully confirmed on the note, otherwise `NULL` so the unsynced-pair index resurfaces the pair.
+
+### Lookback window
+
+Default is **96 hours** (config: `DEFAULT_LOOKBACK_HOURS` in `handler.py`). Paired with the 72h schedule — 24h of overlap so a missed run doesn't drop data.
+
+To run a one-time long backfill, invoke manually with a `lookback_hours` payload:
+
+```bash
+# 90-day backfill
+aws lambda invoke \
+  --function-name gymlaunch-project-note-sync \
+  --invocation-type RequestResponse \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"lookback_hours": 2160}' \
+  /tmp/out.json && cat /tmp/out.json
+```
+
+HubSpot's search API caps at 10,000 results per query. If the lookback window contains more modified notes than that, the Lambda logs a `WARNING: search total=N exceeds HubSpot's 10000 hard limit` line and processes only the oldest 10k. Tighten the window or re-invoke if you see this.
+
+### Known gap (accepted by design)
+
+HubSpot does **not** bump `hs_lastmodifieddate` when a note's associations change. So an old note that gets newly attached to an existing project later will **not** be caught by the modified-since search. Workflow assumption: notes are created fresh on a project, so this case is rare.
+
+If it ever bites, the mitigation would be to cache every project ID we've seen (from any note's association) and periodically batch-read each project's notes via `/crm/v4/associations/0-970/notes/batch/read`. Not built yet.
+
+### Behavior on edge cases
+
+- **Note not attached to any project:** dropped at step 2. Never reaches the state table.
+- **Project with no companies and no contacts:** the note has nothing to inherit on either side, so all desired sets are empty. `companies_ok` and `contacts_ok` both trivially evaluate `true` (empty subset of anything) and the state row gets both `_synced_at` timestamps set. Skipped on subsequent runs unless the project later gains parties.
+- **Note on multiple projects:** associations are the UNION of every linked project's companies/contacts. A note on Project A (Acme + Joe) and Project B (Beta + Sue) gets all four associated.
+- **Project loses an association:** Lambda is purely additive — it will not remove an existing association from a note.
+- **Partial success (one side 429s after retry):** the side that succeeded gets `_synced_at = now()`; the failed side is set to `NULL` so `hubspot_project_note_sync_unsynced_idx` resurfaces the pair and the next run retries.
+
+### Re-running a full backfill
+
+To force every known pair to re-evaluate:
+
+```sql
+TRUNCATE hubspot_project_note_sync;
+```
+
+Then invoke with whatever lookback window covers the time range you care about. Note this only re-evaluates pairs that the notes search will surface — notes outside the lookback window stay un-resynced.
+
+---
+
+### Database schema (`hubspot_project_note_sync`)
+
+One row per `(note_id, project_id)` pair the Lambda has touched. Composite primary key on those two columns. Migration: `db/migrations/008_project_note_sync_schema.sql`.
+
+| Column | Type | What it means |
+|---|---|---|
+| `note_id` | TEXT | HubSpot Note ID, part of PK |
+| `project_id` | TEXT | HubSpot Project ID (object type `0-970`), part of PK |
+| `project_company_ids` | TEXT[] | Snapshot of the project's company IDs as of the last sync attempt. Used for drift detection — if the project gains a new company in HubSpot, this array won't match what the next run sees, triggering re-evaluation. |
+| `project_contact_ids` | TEXT[] | Same, for the project's contact IDs |
+| `companies_synced_at` | TIMESTAMPTZ NULL | When this pair's company side was last fully reconciled. NULL means it still owes work. |
+| `contacts_synced_at` | TIMESTAMPTZ NULL | Same, for the contact side |
+| `last_attempted_at` | TIMESTAMPTZ | When the Lambda last tried this pair |
+| `last_error` | TEXT NULL | Human-readable error from the most recent attempt. NULL if last attempt succeeded. |
+| `attempts` | INT | Total times we've touched this pair. Increments on every upsert. |
+| `created_at`, `updated_at` | TIMESTAMPTZ | Bookkeeping |
+
+**Partial index for retry visibility:** `hubspot_project_note_sync_unsynced_idx` on `last_attempted_at DESC WHERE companies_synced_at IS NULL OR contacts_synced_at IS NULL`. This is the "pairs that owe work" set.
+
+A pair is considered "fully synced" iff both `companies_synced_at` and `contacts_synced_at` are non-NULL AND `project_company_ids` + `project_contact_ids` still match the live HubSpot project (snapshot drift triggers re-eval even on fully-synced rows).
+
+---
+
+### Operator's guide
+
+#### How to trigger a run
+
+**Scheduled (steady state):** EventBridge fires every 72h from the last fire/deploy. No human action needed. Uses the 96h default lookback.
+
+**Manual one-off** (backfills, retries, debugging):
+
+```bash
+# 30-day backfill
+aws lambda invoke \
+  --function-name gymlaunch-project-note-sync \
+  --invocation-type RequestResponse \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"lookback_hours": 720}' \
+  /tmp/out.json && cat /tmp/out.json
+
+# Tighter window for a debug run
+aws lambda invoke \
+  --function-name gymlaunch-project-note-sync \
+  --invocation-type RequestResponse \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"lookback_hours": 1}' \
+  /tmp/out.json && cat /tmp/out.json
+```
+
+`lookback_hours` only affects the single invocation it's passed to. Scheduled runs keep using 36h.
+
+#### Common SQL queries
+
+```sql
+-- High-level health snapshot
+SELECT
+    count(*) FILTER (WHERE companies_synced_at IS NOT NULL AND contacts_synced_at IS NOT NULL) AS fully_synced,
+    count(*) FILTER (WHERE companies_synced_at IS NULL OR contacts_synced_at IS NULL)          AS pending,
+    count(*) AS total_pairs
+FROM hubspot_project_note_sync;
+
+-- Pairs that still owe work (the "must retry" set)
+SELECT note_id, project_id, attempts, last_error, last_attempted_at
+FROM hubspot_project_note_sync
+WHERE companies_synced_at IS NULL OR contacts_synced_at IS NULL
+ORDER BY last_attempted_at DESC;
+
+-- Investigate a specific note — what does the state table say about it?
+SELECT *
+FROM hubspot_project_note_sync
+WHERE note_id = '108879445604';
+
+-- Investigate a specific project — every note we've reconciled to it
+SELECT note_id, companies_synced_at, contacts_synced_at, last_error
+FROM hubspot_project_note_sync
+WHERE project_id = '522215603313'
+ORDER BY last_attempted_at DESC;
+
+-- Recently-touched pairs (e.g., after a manual invoke)
+SELECT note_id, project_id, attempts, last_error
+FROM hubspot_project_note_sync
+WHERE last_attempted_at >= now() - interval '1 hour'
+ORDER BY last_attempted_at DESC;
+
+-- Errors grouped by kind
+SELECT count(*), substring(last_error from 1 for 60) AS error_summary
+FROM hubspot_project_note_sync
+WHERE last_error IS NOT NULL
+GROUP BY substring(last_error from 1 for 60)
+ORDER BY count(*) DESC;
+```
+
+#### How to retry failed pairs
+
+**Important nuance:** the Lambda is driven by the notes search, not by the state table's pending-pair index. A pair with NULL `_synced_at` only gets re-attempted if its underlying note still appears in the search's lookback window.
+
+So to retry:
+
+1. Find when the failed pairs were last attempted:
+   ```sql
+   SELECT MIN(last_attempted_at)
+   FROM hubspot_project_note_sync
+   WHERE companies_synced_at IS NULL OR contacts_synced_at IS NULL;
+   ```
+2. Pick a lookback that covers from then until now, in hours. E.g., if failures were 2 days ago, use `lookback_hours: 72` to be safe.
+3. Manually invoke with that payload.
+
+If the failed pairs' notes haven't been modified in a long time, you may need a very long lookback (`720` for 30 days, `2160` for 90 days). Successful pairs in the window are auto-skipped — extra lookback only costs the search-paginate calls, not the create calls.
+
+#### How to dig into a specific note that "should" have been processed
+
+```sql
+-- Is the pair even in our state table?
+SELECT * FROM hubspot_project_note_sync WHERE note_id = 'YOUR_NOTE_ID';
+```
+
+If no row → Lambda hasn't seen this note in any run yet. Either it's outside the lookback window, or it wasn't attached to a project when last scanned. Verify the note's modification date and current project association in HubSpot.
+
+If row exists with both `_synced_at` populated → Lambda already reconciled it. The companies and contacts in `project_company_ids`/`project_contact_ids` are what got pushed onto the note. If you expected more parties, the project itself doesn't have them — fix the project's associations in HubSpot, and the next run will detect the drift and propagate.
+
+If row exists with `_synced_at` NULL → previous run failed. Check `last_error` for the reason.
+
+#### How to read the CloudWatch logs
+
+```bash
+aws logs tail /aws/lambda/gymlaunch-project-note-sync --follow --format short
+```
+
+The shape of a healthy run:
+
+```
+Project-note sync starting (lookback_hours=96)
+Looking up notes modified at or after 2026-05-21T...
+  [notes search page 1] modified_since_ms=... after=None
+  [notes search page 1] 87 result(s) (running total 87/87)
+    3/87 note(s) attached to a project
+    fetched parties for 3 unique project(s)
+    3/3 pair(s) need work (0 skipped by state table)
+    creating 2 co + 1 ct association(s)
+    committed: +2 co / +1 ct associations, 3 state row(s) upserted
+  notes search complete after 1 page(s), 87 total
+Project-note sync complete: {'lookback_hours': 96, 'notes_seen': 87, 'notes_on_project': 3,
+                              'pairs_skipped': 0, 'pairs_worked': 3, 'company_assoc_made': 2,
+                              'contact_assoc_made': 1, 'errors': 0}
+```
+
+Things to watch for:
+
+| Log line | What it means |
+|---|---|
+| `Another project-note sync is running, exiting` | Two invocations overlapped; the second yielded to the advisory lock. Harmless. |
+| `WARNING: search total=N exceeds HubSpot's 10000 hard limit` | The lookback window has too many notes. Tighten the window and re-invoke. |
+| `Rate limited by HubSpot, waiting Ns and retrying` | One HTTP retry happened. Fine, just means HubSpot was busy. |
+| `Batch create notes→{type} failed: NNN ...` | A batch-create call failed. If HTML 404, the endpoint URL is wrong. If JSON 429 after retry, rate limit. If MISSING_SCOPES, scope on Private App changed. |
+| `N co association(s) FAILED: [...]` | Specific pairs that failed. Their state rows get NULL on the failed side and surface in the pending-pair query above. |
+
+#### Reset scenarios
+
+| Goal | Action |
+|---|---|
+| Retry just the failed pairs | Manual invoke with `lookback_hours` covering when failures originated |
+| Re-sync everything currently in scope | `TRUNCATE hubspot_project_note_sync;` + manual invoke with desired window |
+| Pause the nightly schedule | `aws events disable-rule --name gymlaunch-project-note-sync-nightly` |
+| Resume the nightly schedule | `aws events enable-rule --name gymlaunch-project-note-sync-nightly` |
+| Delete a specific bad row | `DELETE FROM hubspot_project_note_sync WHERE note_id = 'X' AND project_id = 'Y';` then re-invoke with a window that catches that note |
+
+#### Why this Lambda exists in context
+
+The long-term goal is a unified customer activity layer for AI insights — a "brain" that knows every SMS, call, Slack message, Asana task, and HubSpot interaction tied to a given client. For that to work, every note on a project has to be reachable from the company/contact's activity feed. HubSpot's UI shows project-notes on the project, but they're invisible at the company/contact level unless explicitly associated — which is what this Lambda fixes.
+
+Without this Lambda, the AI brain would have a blind spot for any context captured as a project-note. With it, project-notes propagate to the related company and contact automatically (with up to 24h latency from the nightly cron).
+
+### Inspecting state
+
+```sql
+-- Pairs that still owe work
+SELECT note_id, project_id, attempts, last_error
+FROM hubspot_project_note_sync
+WHERE companies_synced_at IS NULL OR contacts_synced_at IS NULL
+ORDER BY last_attempted_at DESC;
+
+-- How many pairs we've reconciled overall
+SELECT count(*) FILTER (WHERE companies_synced_at IS NOT NULL AND contacts_synced_at IS NOT NULL) AS fully_synced,
+       count(*) FILTER (WHERE companies_synced_at IS NULL OR contacts_synced_at IS NULL) AS pending
+FROM hubspot_project_note_sync;
+```
+
+### Advisory lock
+
+Uses `pg_try_advisory_lock(hashtext('project_note_sync'))` to prevent overlapping runs, matching the pattern in the Asana and HubSpot syncs.
 
 ---
 
