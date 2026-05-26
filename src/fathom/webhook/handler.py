@@ -12,6 +12,25 @@ import ssl
 import pg8000
 
 
+def parse_bool(val):
+    """
+    Coerce a value to bool or None, handling Zapier's quirks.
+    Zapier sometimes serializes boolean fields as "True", "False", or comma-joined
+    strings like "True,True" when a field has multiple values. We take the first
+    token and normalize it.
+    """
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val
+    first = str(val).split(",")[0].strip().lower()
+    if first in ("true", "1", "yes"):
+        return True
+    if first in ("false", "0", "no"):
+        return False
+    return None
+
+
 def get_db_connection():
     ctx = ssl.create_default_context()
     return pg8000.connect(
@@ -118,7 +137,7 @@ def lambda_handler(event, context):
             invitees.append({
                 "name": payload.get("meeting_invitees_name"),
                 "email": primary_email,
-                "is_external": payload.get("meeting_invitees_is_external"),
+                "is_external": parse_bool(payload.get("meeting_invitees_is_external")),
                 "domain_name": payload.get("meeting_external_domains_domain_name"),
             })
 
