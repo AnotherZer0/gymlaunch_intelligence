@@ -21,6 +21,7 @@ build/
 logs/
 *.log
 *.sqlite3
+.scratch/
 
 # AWS SAM / CDK / deploy artifacts
 .aws-sam/

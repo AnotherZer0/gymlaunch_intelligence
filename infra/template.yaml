@@ -51,6 +51,16 @@ Parameters:
     Type: String
   SesToAddress:
     Type: String
+  SupabaseUrl:
+    Type: String
+    Description: "Supabase project URL (e.g. https://<ref>.supabase.co). Not secret."
+  SupabaseServiceRoleKey:
+    Type: String
+    NoEcho: true
+    Description: "Supabase service_role JWT — bypasses RLS, treat like a root password."
+  LeadDb2SheetId:
+    Type: String
+    Description: "Google Sheet ID for the `Lead Integration Database V2.0` workbook (contains the `00 - Database` master client tab)."
 
 Globals:
   Function:
@@ -335,6 +345,57 @@ Resources:
             Name: gymlaunch-stripe-finance-report-weekday
             Enabled: true
 
+  SupabaseLeadSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-supabase-lead-sync
+      CodeUri: ../src/sync/supabase_leads/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          SUPABASE_URL: !Ref SupabaseUrl
+          SUPABASE_SERVICE_ROLE_KEY: !Ref SupabaseServiceRoleKey
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        # 08:00 UTC = 2am CST in winter, 3am CDT in summer. Either way it's the
+        # middle of the night and well after upstream webhooks have settled.
+        DailySync:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 8 * * ? *)
+            Name: gymlaunch-supabase-lead-sync-daily
+            Enabled: true
+
+  LeadDb2SheetSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-lead_db2-sheet-sync
+      CodeUri: ../src/sync/lead_db2_sheet/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          GOOGLE_SERVICE_ACCOUNT_B64: !Ref GoogleServiceAccountB64
+          LEAD_DB2_SHEET_ID: !Ref LeadDb2SheetId
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        # 07:00 UTC — fires one hour before gymlaunch-supabase-lead-sync so the
+        # client master snapshot is fresh by the time the lead mirror runs (and
+        # any phase-2 compare picks up the right system_user flag per client).
+        DailySync:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 7 * * ? *)
+            Name: gymlaunch-lead_db2-sheet-sync-daily
+            Enabled: true
+
 Outputs:
   SlackFunctionArn:
     Value: !GetAtt SlackSyncFunction.Arn
@@ -356,6 +417,10 @@ Outputs:
     Value: !GetAtt ProjectNoteSyncFunction.Arn
   FathomWebhookFunctionArn:
     Value: !GetAtt FathomWebhookFunction.Arn
+  SupabaseLeadSyncFunctionArn:
+    Value: !GetAtt SupabaseLeadSyncFunction.Arn
+  LeadDb2SheetSyncFunctionArn:
+    Value: !GetAtt LeadDb2SheetSyncFunction.Arn
   FathomWebhookUrl:
     Value: !Sub "https://${SmsApi}.execute-api.${AWS::Region}.amazonaws.com/fathom/webhook"
     Description: "Fathom call transcript webhook — point Zapier here"

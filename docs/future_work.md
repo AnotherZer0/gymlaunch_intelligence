@@ -1,0 +1,347 @@
+# Future Work
+
+A running list of intentionally-deferred work for the GymLaunch Intelligence
+data lake. Each entry captures what to do, why we deferred it, and what would
+trigger picking it back up.
+
+**When to add an entry:** every time a design decision deliberately defers a
+piece of work, a "we should do X eventually" thought emerges mid-conversation,
+or a "future-you will thank you" note comes up during a review. Better to
+overcapture than to lose context across sessions.
+
+**When picking work back up:** scan this file first. Look for entries whose
+"revisit when" condition is now true. If you're starting a new session on a
+topic that touches a deferred area, surface the relevant entry in your first
+response so the user remembers the context.
+
+**Status tags:**
+- `[open]` — deferred, not started
+- `[in-progress]` — being worked on right now
+- `[done]` — completed; left here for context and to record when it landed
+- `[abandoned]` — explicitly decided not to do (with reasoning)
+
+---
+
+## [open] Phone validator rewrite + HubSpot workflow wiring
+
+**Captured:** 2026-05-22
+
+**Revisit when:** user has decided what to do when no usable numbers are found
+(neither phone nor mobile can be parsed). Everything else is spec'd and ready to write.
+
+**Why it matters:**
+The current `src/phone/validator/handler.py` is deployed and the endpoint is live,
+but the logic doesn't match the actual requirements. It was designed as a combined
+phone+mobile normalizer but the two fields serve completely different purposes.
+Do NOT wire it to HubSpot until the rewrite is done.
+
+**Open question (blocking):**
+What to do when `mode: "mobile"` runs and mobile cannot be parsed at all?
+Options: flag the contact with a HubSpot property, create a note only, do nothing silently.
+User was deciding — ask them before writing any code.
+
+**Agreed design — two modes in one Lambda:**
+
+`mode: "mobile"` (SMS use case — primary)
+- Normalize mobilephone to E.164, run Twilio Lookup on mobile only
+- Country allowlist: US, CA, GB, JE, IM, BS, PR, AU, NZ
+- Line type suppression: suppress `landline` and `voip`; allow `mobile`, `nonFixedVoip`, others
+- If already E.164 — still run Lookup, just don't flag for update
+- NEVER touch phone field
+- Return `note_body` as pre-formatted string (workflow creates the note)
+
+`mode: "phone"` (power dialer use case — secondary)
+- Normalize phone only, NO Twilio Lookup
+- Return validity flag
+- If phone invalid + mobile valid → return `new_phone_value` = mobile E.164 (workflow writes it)
+- NEVER touch mobilephone field
+
+**Two HubSpot workflows to build after rewrite:**
+1. Mobile validation — trigger: mobilephone updated (filter: last 1 day). Branch on
+   `singular_route`. Set mobilephone if needed. Create note from `note_body`.
+2. Phone shape check — trigger: list membership (power dialer list). If phone invalid
+   and new_phone_value present → set phone. Create note.
+
+**What to build:**
+1. Confirm no-usable-numbers handling with user
+2. Rewrite `src/phone/validator/handler.py` with two-mode logic
+3. Redeploy (`bash scripts/deploy.sh`)
+4. Build Workflow 1 in HubSpot (mobile validation)
+5. Build Workflow 2 in HubSpot (phone shape / power dialer)
+
+---
+
+## [open] Fathom nightly API sync
+
+**Captured:** 2026-05-16
+
+**Revisit when:** Fathom API details are available (endpoint shape, field names,
+pagination) and a Lambda name is chosen.
+
+**Why it matters:**
+The live webhook path (Zapier → `gymlaunch-fathom-webhook`) is the fast path but
+is not guaranteed delivery. If Zapier has downtime, a zap fails silently, or calls
+occurred before the webhook was set up, those calls never land in the DB. A nightly
+sync against the Fathom API is the safety net — it pulls all calls within a rolling
+window and upserts them idempotently on `fathom_id`. First run backfills all
+historical calls; subsequent runs cover a rolling 48h window to catch webhook gaps.
+
+**What to build:**
+1. New Lambda (name TBD — ask user before writing code) in `src/fathom/sync/`
+2. Hits Fathom API, paginates through calls filtered to last N hours (48h default,
+   configurable via Lambda event payload for manual backfills)
+3. Maps API response fields → `fathom_call` + `fathom_call_invitee` columns
+   (field names may differ from webhook payload — verify against API docs)
+4. Upserts on `fathom_id` — identical conflict logic to webhook handler
+5. Add to `infra/template.yaml` on a nightly EventBridge schedule (e.g. `cron(0 6 * * ? *)` — 1am CDT)
+6. Fetch `gymlaunch/fathom/Fathom-API-Key` from Secrets Manager, add to `deploy.sh`
+
+**Blocked on:** Fathom API docs / sample response to confirm field mapping.
+
+---
+
+## [open] Fathom summary PATCH endpoint
+
+**Captured:** 2026-05-16
+
+**Revisit when:** n8n → Claude summary pipeline is ready to be built.
+
+**Why it matters:**
+The `fathom_call.summary` column exists but is always NULL. The intended pipeline
+is: n8n polls for NULL summaries → sends `transcript_plaintext` to Claude API →
+Claude returns a short summary → n8n calls a PATCH endpoint to write it back.
+That PATCH endpoint doesn't exist yet.
+
+**What to build:**
+1. New route `PATCH /fathom/summary` on the existing `SmsApi` API Gateway
+2. Accepts JSON body: `{"fathom_id": "...", "summary": "..."}`
+3. Validates `X-Webhook-Secret` header (same secret as webhook handler)
+4. Updates `fathom_call SET summary = $1 WHERE fathom_id = $2`
+5. Returns 404 if `fathom_id` not found, 200 on success
+6. Can live in the existing `gymlaunch-fathom-webhook` Lambda (add a second route)
+   or a new Lambda — ask user before writing code
+
+**See also:** summary design note below (two-tier retrieval strategy).
+
+---
+
+## [open] Fathom summary pipeline + two-tier retrieval design
+
+**Captured:** 2026-05-16
+
+**Revisit when:** ready to build the n8n → Claude → write-back pipeline and/or
+the first AI brain query that touches call data.
+
+**Decision made (don't re-litigate):**
+Keep both `transcript_plaintext` and `summary`. They serve different purposes.
+Feeding raw transcripts to an agent for a "last 30 days" query costs ~100–150k
+tokens for a typical client with 15 calls. Summaries (~300 tokens each) cut that
+to ~4,500 tokens for the first pass, with full transcripts fetched selectively
+when a summary flags something worth digging into. 10–15x cheaper, same output
+quality.
+
+**Two-tier retrieval pattern:**
+1. Agent reads all summaries for the time window → gets shape of the period
+2. Agent identifies calls worth examining closely → fetches specific full transcripts
+This is essentially RAG applied to call transcripts.
+
+**What to build when picking this up:**
+1. Decide on summary structure — flat string ("10 second summary") vs. structured
+   output (key topics, outcome, action items / commitments). Structured is more
+   useful for the agent's first-pass scan but requires a richer Claude prompt.
+   Flat string is simpler to store and works fine for a v1.
+2. Build the summarization Lambda or n8n workflow: poll for `summary IS NULL` →
+   send `transcript_plaintext` to Claude API → write back via PATCH endpoint
+3. Build the PATCH endpoint (see separate entry above)
+4. When building the AI brain query layer, always start with summaries and only
+   pull full transcripts when the agent determines a specific call is relevant.
+
+---
+
+## [open] Replace the n8n FB-lead pipeline
+
+**Captured:** 2026-05-29
+
+**Revisit when:** team commits to the migration, OR n8n has an outage that
+causes customer-impacting lead loss, OR Supabase project is being torn down for
+cost/security reasons.
+
+**Why it matters:**
+The upstream n8n workflow `00 - Main Workflow` is the load-bearing FB-lead →
+GHL forwarder, not a monitoring workflow. If it dies, customers stop receiving
+leads in their CRM. The entire `00 - Database` sheet, the Supabase
+`02 - Facebook Leads` / `03 - HighLevel Leads` tables, and our RDS mirrors all
+depend on it. Replacing it brings the path on-platform with the same
+resilience model as the SMS pipeline.
+
+**What to build:**
+1. **`gymlaunch-fb-lead-webhook`** — a Lambda webhook receiver at
+   `POST /fb/leadgen` on the existing `gymlaunch-intelligence` API Gateway.
+   Validates Meta's `X-Hub-Signature-256` HMAC, writes the lead directly to RDS,
+   calls the GHL API to create the corresponding contact using each client's
+   per-location API key.
+2. **`gymlaunch-ghl-contact-webhook`** — Lambda at `POST /ghl/contact`.
+   Validates a configured shared secret, writes the contact event directly to
+   RDS.
+3. **Re-subscribe each FB page** (~700) to OUR webhook URL instead of n8n's.
+   One-time script using the existing FB System User app.
+4. **Update each GHL location's outbound webhook config** to point at our
+   endpoint. Tedious but scriptable via the GHL API.
+5. **Run in parallel** with the n8n workflow for 1-2 weeks. Reconcile RDS
+   counts vs Supabase counts. Once parity is established, disable the n8n
+   workflow and eventually drop the Supabase project.
+
+**Cascade effects when this lands:**
+- `gymlaunch-supabase-lead-sync` becomes obsolete (remove it from the stack).
+- `gymlaunch-lead_db2-sheet-sync` may stay (if the sheet survives as a manual
+  diagnostic UI) or pivot to syncing FROM RDS BACK TO a sheet so the team
+  retains a familiar interface.
+- The phase-2 compare sheet doubles as the safety net during the migration —
+  any drift between FB count and GHL count after cutover surfaces immediately.
+
+---
+
+## [open] HubSpot Projects API — support ticket follow-up
+
+**Captured:** 2026-05-29
+
+**Revisit when:** HubSpot support responds to ticket `correlationId 019e5159-e757-7721-818b-5f78ef50872c`
+(portal 43776308) granting access to the Projects list-instances endpoint, OR
+HubSpot announces general availability of the `/crm/v3/objects/0-970` endpoint.
+
+**Why it matters:**
+`gymlaunch-project-note-sync` uses a notes-first design as a workaround because
+`/crm/v3/objects/0-970` (and `/crm/objects/2026-03/projects`) returns
+"scope isn't available for public use" for all Private Apps — including with
+`projects.read` and `custom-objects-read` scopes. The v4 association endpoints
+work normally; we use them to sidestep the gate.
+
+If projects listing is ever granted, a projects-first design would close the
+known coverage gap (see next entry) — we could iterate all projects, not just
+recently-modified notes.
+
+**What to build when revisiting:**
+1. Test `GET /crm/v3/objects/0-970` — if it returns data, the gate is lifted
+2. Rewrite `src/sync/hubspot_project_notes/handler.py` to projects-first:
+   iterate all projects, fetch their notes and associated parties, diff vs state
+3. Remove the `hs_lastmodifieddate` lookback window — no longer needed once
+   we can enumerate projects directly
+4. Consider archiving the `hubspot_project_note_sync` state table or pivoting its
+   PK to `(project_id, object_id, object_type)` for the new design
+
+---
+
+## [open] Project-note sync coverage gap — old note newly attached to project
+
+**Captured:** 2026-05-29
+
+**Revisit when:** a real-world case surfaces where a note was created before a
+project existed (or created outside a project, then manually attached later),
+and that note's associations never get propagated.
+
+**Why it matters:**
+HubSpot does NOT bump `hs_lastmodifieddate` when a note's associations change.
+So if someone creates a note outside a project today, then attaches it to a
+project tomorrow, the modified-since search used by `gymlaunch-project-note-sync`
+will never surface that note. The gap is accepted for now because the team's
+workflow is to create notes directly inside projects — the retroactive-attach
+case is rare and hasn't been observed in production yet.
+
+**Mitigation to build if the gap becomes real:**
+1. Accumulate all `project_id` values we've seen in `hubspot_project_note_sync`
+   (they're already in the state table)
+2. Add a periodic (e.g., monthly) pass that reads each project's notes via
+   `/crm/v4/associations/0-970/notes/batch/read` — no modified-date filter
+3. Diff the full note list against state rows per project — creates any missing
+   associations
+4. Can be added as a separate path in the existing Lambda triggered by a manual
+   invocation payload (e.g., `{"full_scan": true}`) rather than always running
+
+---
+
+## [open] Systematic employee data quality — triage before building more Lambdas
+
+**Captured:** 2026-05-29
+
+**Revisit when:** the next data quality issue surfaces and the team asks "should
+we build a janitor Lambda for this?"
+
+**Context:**
+Late in the project-note-sync session, the user noted there's a lot of orphaned
+records and misplaced information with employees (e.g., HubSpot records
+incorrectly associated, data in the wrong place). The question was whether the
+reconciliation-Lambda pattern we built is "common practice or overkill."
+
+**Framework to apply before building each new fixer:**
+1. **Classify the failure:** Is this a prevention problem (bad input), a
+   detection problem (we don't know when it's wrong), or a correction problem
+   (we know it's wrong, now fix it)?
+2. **Is the root cause fixable?** A janitor Lambda that runs forever is a
+   maintenance tax. If the upstream source of truth can be fixed (e.g., a form
+   validation, a HubSpot workflow property rule), do that first.
+3. **Volume and frequency:** ~11 records/30 days (project-note-sync scale) is
+   worth a background Lambda. Thousands of records/day suggests a systemic
+   input problem that needs a source fix, not a fixer.
+4. **Idempotency cost:** Build state tables only when the scan is expensive
+   (many API calls) and most records don't need work. For cheap scans
+   (pure DB), skip the state table and always re-diff.
+
+**Candidate issues to triage (collect before the next session on this topic):**
+- Orphaned HubSpot company/contact associations (no project, no owner)
+- Notes associated to wrong object type
+- Any other "misplaced information" cases the user has observed
+
+---
+
+## [open] Harden GHL API key storage
+
+**Captured:** 2026-05-29
+
+**Revisit when:** team grows beyond one engineer with DB access, OR a security
+review flags plaintext storage as unacceptable, OR `pg_dump` exposure becomes a
+real concern (e.g., starting to share backups with anyone).
+
+**Why it matters:**
+Each GHL location has an API key stored as plaintext text in the
+`client_lead_master.hl_sub_account_api_key` column. The keys were already
+plaintext in the upstream Google Sheet and in Supabase, so adding them to RDS
+didn't worsen exposure. But today's threat model relies on a single point of
+access control: "only one person has DB credentials." That assumption gets
+brittle the moment a second engineer is onboarded.
+
+**Decision history:** Earlier in the session we evaluated Secrets Manager
+(Option B), a separate role-restricted table in Postgres (Option D), and
+plaintext-in-existing-table (Option A). Picked A because:
+- The IAM boundary explicitly denies `secretsmanager:PutSecretValue` for
+  Lambda roles, which is the right design — making it loose to auto-sync
+  would loosen security for ALL Lambdas.
+- The keys are already broadly internally visible (sheet is shared).
+- Setting up Postgres role separation requires plumbing (multiple DB users,
+  multiple Secrets Manager entries, per-Lambda connection logic) that doesn't
+  exist anywhere else in this repo. Worth doing when there's actual benefit.
+
+**What to build when revisiting:**
+Recommended target is **Option B2** — Secrets Manager + manual refresh script:
+
+1. Create AWS Secrets Manager secret `gymlaunch/ghl/location_api_keys` —
+   single JSON blob keyed by `hl_sub_account_location_id`. Same shape as
+   `gymlaunch/stripe/api_keys`.
+2. Write `scripts/refresh_ghl_keys.py` — reads the `00 - Database` sheet,
+   builds the `{location_id: api_key}` dict, calls `PutSecretValue`. Invoked
+   from operator's machine (which has wider IAM than Lambda boundary
+   allows). Run when keys rotate or new clients are added.
+3. Update any GHL-calling Lambdas (FB lead forwarder, etc.) to fetch the
+   secret on cold start, cache the parsed dict in module scope, look up
+   keys by location_id.
+4. Migration to drop `hl_sub_account_api_key` from `client_lead_master`
+   (only after consumers are switched over).
+5. Re-run sheet sync with the column gone — Lambda's `RDS_COLUMNS` list and
+   `REQUIRED_SHEET_HEADERS` set both lose the entry; sheet itself keeps the
+   column (it's used by n8n upstream).
+
+**Alternative considered:** Option D-full (separate `client_api_keys` table
+with role-restricted access). Same security properties as B2 but more
+operational complexity (managing additional Postgres roles, per-Lambda
+connection switching). B2 wins on simplicity.
+
+---

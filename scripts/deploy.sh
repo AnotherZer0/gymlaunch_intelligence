@@ -57,9 +57,24 @@ STRIPE_API_KEYS_B64=$(aws secretsmanager get-secret-value \
   --query SecretString --output text \
   | base64 -w 0)
 
+# Supabase project URL + service_role JWT, stored as one JSON secret.
+SUPABASE_SECRET_JSON=$(aws secretsmanager get-secret-value \
+  --secret-id gymlaunch/supabase/api \
+  --query SecretString --output text)
+SUPABASE_URL=$(echo "$SUPABASE_SECRET_JSON" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['url'])")
+SUPABASE_SERVICE_ROLE_KEY=$(echo "$SUPABASE_SECRET_JSON" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['service_role_key'])")
+unset SUPABASE_SECRET_JSON
+
 # From address for the daily finance report email (domain must be verified in SES us-east-1)
 SES_FROM_ADDRESS="reports@gymlaunch.com"
 SES_TO_ADDRESS="ap@gymlaunchsecrets.com"
+
+# Google Sheet that holds the `00 - Database` master client tab. Read by
+# gymlaunch-lead_db2-sheet-sync. The service account must have read access on
+# this sheet — share it with n8n-sheets-integration@zsign-transfer.iam.gserviceaccount.com.
+LEAD_DB2_SHEET_ID="1JGdbjR1g8MF0zzraOwyPNNY7-jRrVIzk2ZZI-FWhky0"
 
 echo "Building..."
 sam build
@@ -85,7 +100,10 @@ sam deploy \
     "FathomWebhookSecret=${FATHOM_WEBHOOK_SECRET}" \
     "StripeApiKeysB64=${STRIPE_API_KEYS_B64}" \
     "SesFromAddress=${SES_FROM_ADDRESS}" \
-    "SesToAddress=${SES_TO_ADDRESS}"
+    "SesToAddress=${SES_TO_ADDRESS}" \
+    "SupabaseUrl=${SUPABASE_URL}" \
+    "SupabaseServiceRoleKey=${SUPABASE_SERVICE_ROLE_KEY}" \
+    "LeadDb2SheetId=${LEAD_DB2_SHEET_ID}"
 
 echo "Setting log retention..."
 set_retention() {
@@ -102,5 +120,7 @@ set_retention /aws/lambda/gymlaunch-phone-validator
 set_retention /aws/lambda/gymlaunch-fathom-webhook
 set_retention /aws/lambda/gymlaunch-stripe-finance-report
 set_retention /aws/lambda/gymlaunch-project-note-sync
+set_retention /aws/lambda/gymlaunch-supabase-lead-sync
+set_retention /aws/lambda/gymlaunch-lead_db2-sheet-sync
 
 echo "Done."

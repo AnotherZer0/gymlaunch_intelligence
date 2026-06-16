@@ -39,6 +39,9 @@ but changing it would require tearing down and recreating all resources, so it s
 | `gymlaunch-phone-validator` | HTTP webhook (API Gateway) | `src/phone/validator/` |
 | `gymlaunch-stripe-finance-report` | M-F at 10am Central (15:00 UTC) | `src/sync/stripe/finance_report/` |
 | `gymlaunch-project-note-sync` | Every 72 hours | `src/sync/hubspot_project_notes/` |
+| `gymlaunch-fathom-webhook` | HTTP webhook (API Gateway) | `src/fathom/webhook/` |
+| `gymlaunch-supabase-lead-sync` | Daily at 08:00 UTC (2am CST / 3am CDT) | `src/sync/supabase_leads/` |
+| `gymlaunch-lead_db2-sheet-sync` | Daily at 07:00 UTC (one hour before supabase-lead-sync) | `src/sync/lead_db2_sheet/` |
 
 All functions run in the VPC (subnets `subnet-a085c381`, `subnet-3d566b33`) so they can reach RDS.  
 All share IAM role `gymlaunch-slack-sync` (role named after first Lambda — same naming quirk as stack).  
@@ -56,6 +59,9 @@ Permissions boundary: `gymlaunch-lambda-boundary`.
 /aws/lambda/gymlaunch-phone-validator
 /aws/lambda/gymlaunch-stripe-finance-report
 /aws/lambda/gymlaunch-project-note-sync
+/aws/lambda/gymlaunch-fathom-webhook
+/aws/lambda/gymlaunch-supabase-lead-sync
+/aws/lambda/gymlaunch-lead_db2-sheet-sync
 ```
 
 Retention: 30 days (set by deploy script).
@@ -77,6 +83,7 @@ All secrets are in `us-east-1`.
 | `gymlaunch/twilio/octopods_webhook_url` | `url` | `gymlaunch-sms-interceptor` |
 | `gymlaunch/fathom/Fathom-Webhook-Secret` | `secret` | `gymlaunch-fathom-webhook` |
 | `gymlaunch/stripe/api_keys` | _(raw JSON)_ | `gymlaunch-stripe-finance-report` |
+| `gymlaunch/supabase/api` | `url` + `service_role_key` (raw JSON) | `gymlaunch-supabase-lead-sync` |
 
 The Google service account JSON is base64-encoded by deploy.sh and passed as
 `GOOGLE_SERVICE_ACCOUNT_B64`. It must have Editor access to the Google Sheet.
@@ -104,6 +111,9 @@ The Google service account JSON is base64-encoded by deploy.sh and passed as
 | `db/migrations/007_stripe_schema.sql` | `stripe_payout_export` table |
 | `db/migrations/007_fathom_schema.sql` | `fathom_call`, `fathom_call_invitee` tables |
 | `db/migrations/008_project_note_sync_schema.sql` | `hubspot_project_note_sync` table |
+| `db/migrations/009_supabase_lead_sync_schema.sql` | 7 `supabase_*` mirror tables + `supabase_sync_state` |
+| `db/migrations/010_client_lead_master_schema.sql` | `client_lead_master` — mirror of `00 - Database` sheet |
+| `db/migrations/011_client_lead_master_add_api_key.sql` | Adds `hl_sub_account_api_key` column to `client_lead_master` |
 
 ### Key Tables
 
@@ -118,6 +128,17 @@ The Google service account JSON is base64-encoded by deploy.sh and passed as
 | `sms_delivery_event` | One row per Twilio StatusCallback — delivery failures, HubSpot suppression outcome |
 | `stripe_payout_export` | One row per processed Stripe payout — prevents duplicate finance reports |
 | `hubspot_project_note_sync` | One row per (note, project) pair processed by the nightly project-note sync. Snapshot of the project's companies/contacts + per-side synced_at timestamps. |
+| `fathom_call` | One row per Fathom-recorded call — transcript, metadata, `summary` (AI-generated, nullable) |
+| `fathom_call_invitee` | One row per invitee per call — indexed on `email` for AI brain queries |
+| `supabase_facebook_lead` | Mirror of Supabase `02 - Facebook Leads`. One row per FB lead. Joins to `asana_agency_board_task` on `sub_account_id = hl_sub_account_location_id`. |
+| `supabase_highlevel_lead` | Mirror of Supabase `03 - HighLevel Leads`. One row per GHL lead. `source` is `hlold` or `hlnew` (both count as GHL). |
+| `supabase_lead_form` | Mirror of Supabase `01 - Lead Form Database`. Small form metadata reference. |
+| `supabase_lead_form_detail` | Mirror of Supabase `lead_forms` — richer form metadata with JSONB columns (questions, thank-you page config). |
+| `supabase_facebook_form` | Mirror of Supabase `Facebook Form Database`. Legacy. PK is `facebook_page_id` alone (one row per page in source). |
+| `supabase_facebook_lead_form` | Mirror of Supabase `Facebook Lead Form Database`. Legacy, near-empty. |
+| `supabase_facebook_lead_legacy` | Mirror of Supabase `Facebook Leads Database`. Predecessor of `supabase_facebook_lead` with different column names. |
+| `supabase_sync_state` | Per-table sync watermark — last run timestamp, row count, success/error status. PK: `table_name`. Despite the name, used as the generic state table by both `gymlaunch-supabase-lead-sync` and `gymlaunch-lead_db2-sheet-sync`. |
+| `client_lead_master` | Mirror of the `00 - Database` tab in the `Lead Integration Database V2.0` Google Sheet. Carries both auto-written fields (basic FB/GHL/Asana identifiers, populated by the n8n FB-lead workflow) and 10 manually-maintained diagnostic flags including `is_system_user` (Yes/No — sheet header is `system_user`, renamed because that's a PG 16+ reserved word), `fb_app_status`, `ghl_connection`. PK: `facebook_page_id`. Includes `hl_sub_account_api_key` (plaintext) as of migration 011 — future hardening tracked in `docs/future_work.md`. |
 
 ### Key Views
 
@@ -129,6 +150,22 @@ The view is a live query — no refresh needed. Active count is derived from
 `asana_agency_board_task` filtered to active sections with a real media buyer assigned.
 
 Query reference: `db/how_to_query.txt`
+
+### Supabase → RDS table map
+
+Quick lookup of what mirrors what in the daily `gymlaunch-supabase-lead-sync`.
+Full context for these tables is in the [Supabase Lead Sync](#supabase-lead-sync) section.
+
+| Supabase source table | RDS destination table | Notes |
+|---|---|---|
+| `02 - Facebook Leads` | `supabase_facebook_lead` | Active. Compare side A. |
+| `03 - HighLevel Leads` | `supabase_highlevel_lead` | Active. Compare side B. `source` is `hlold` or `hlnew`. |
+| `01 - Lead Form Database` | `supabase_lead_form` | Active. Form metadata reference. |
+| `lead_forms` | `supabase_lead_form_detail` | Active. Richer form metadata (JSONB questions, thank-you page). |
+| `Facebook Form Database` | `supabase_facebook_form` | Legacy. |
+| `Facebook Lead Form Database` | `supabase_facebook_lead_form` | Legacy, near-empty. |
+| `Facebook Leads Database` | `supabase_facebook_lead_legacy` | Legacy. Predecessor of `02 - Facebook Leads`. |
+| `00 - Lead Integration Main Database` | _(not mirrored)_ | Same per-client metadata is in `asana_agency_board_task`. Also held `hl_sub_account_api_key` plaintext, which we deliberately don't propagate. |
 
 ---
 
@@ -194,6 +231,7 @@ deleted manually from the Lambda console.
 | `POST /sms/inbound` | Twilio inbound message webhook |
 | `POST /sms/status` | Twilio StatusCallback (delivery events) |
 | `POST /phone/validate` | Phone normalization + Twilio Lookup (called from HubSpot workflows) |
+| `POST /fathom/webhook` | Fathom call transcript webhook (fired by Zapier) |
 
 ### gymlaunch-sms-interceptor
 
@@ -619,6 +657,180 @@ FROM hubspot_project_note_sync;
 ### Advisory lock
 
 Uses `pg_try_advisory_lock(hashtext('project_note_sync'))` to prevent overlapping runs, matching the pattern in the Asana and HubSpot syncs.
+
+---
+
+## Fathom
+
+### gymlaunch-fathom-webhook
+
+Receives call transcript payloads fired by Zapier after each Fathom-recorded call.
+Validates an `X-Webhook-Secret` header on every request (constant-time compare). Returns 403
+on mismatch, 400 if `fathom_id` is missing, 200 on success, 500 on DB error.
+
+Writes to two tables:
+- `fathom_call` — upserted on `fathom_id`. `summary` column is left NULL; filled later by AI pipeline.
+- `fathom_call_invitee` — upserted on `(call_id, email)`. Primary invitee comes from the flat
+  `meeting_invitees_email` / `meeting_invitees_name` / `meeting_invitees_is_external` fields.
+  Additional invitees from `meeting_invitees` array are parsed if present.
+
+**Zapier setup:** point the webhook action at `{SmsApiUrl}/fathom/webhook`, method POST,
+body type JSON. Map all Fathom fields directly. Add a custom header:
+`X-Webhook-Secret: <value from gymlaunch/fathom/Fathom-Webhook-Secret>`.
+
+**AI brain query pattern** — all calls involving a contact:
+```sql
+SELECT fc.*
+FROM fathom_call fc
+JOIN fathom_call_invitee fci ON fci.call_id = fc.id
+WHERE fci.email = 'john@example.com'
+ORDER BY fc.meeting_scheduled_start_time DESC;
+```
+
+See `src/fathom/webhook/how_to_query.txt` for full query reference.
+
+---
+
+## Supabase Lead Sync
+
+**Lambda:** `gymlaunch-supabase-lead-sync`
+**Schedule:** `cron(0 8 * * ? *)` — daily at 08:00 UTC = 2am CST (winter) / 3am CDT (summer).
+**Source:** `src/sync/supabase_leads/`
+**Secret:** `gymlaunch/supabase/api` — JSON with keys `url` and `service_role_key`.
+
+### Why it exists
+
+Two upstream webhook flows (Facebook Lead Ads → n8n, GHL Contact-Created → n8n) write into a Supabase project, one row per lead per side. The expectation is that the two sides match per-client per-day; mismatches are an integration break. Phase 1 (this Lambda) mirrors the Supabase tables to RDS so we can query them with the rest of the data lake. Phase 2 (deferred) adds a comparison view + a Google Sheet output for daily monitoring.
+
+### Connection method
+
+REST API (PostgREST) using the Supabase `service_role` JWT, **not** direct Postgres. The Supabase DB password is suspected to be hardcoded in an n8n workflow upstream, and rotating it would risk breaking that workflow. The service_role JWT is a separate auth mechanism.
+
+### Tables mirrored
+
+| Supabase source | RDS destination | Role |
+|---|---|---|
+| `02 - Facebook Leads` | `supabase_facebook_lead` | Active — compare side A in phase 2 |
+| `03 - HighLevel Leads` | `supabase_highlevel_lead` | Active — compare side B in phase 2 |
+| `01 - Lead Form Database` | `supabase_lead_form` | Active — small reference |
+| `lead_forms` | `supabase_lead_form_detail` | Active — richer form metadata |
+| `Facebook Form Database` | `supabase_facebook_form` | Legacy |
+| `Facebook Lead Form Database` | `supabase_facebook_lead_form` | Legacy, near-empty |
+| `Facebook Leads Database` | `supabase_facebook_lead_legacy` | Legacy, predecessor of `02 - Facebook Leads` |
+
+**Not mirrored:** `00 - Lead Integration Main Database` — the same per-client metadata is already captured in `asana_agency_board_task` (gym_name, client_name, facebook_page_id, facebook_ad_account_id, hl_sub_account_location_id, hubspot_company_id). The Supabase Main table also stored GHL API keys in plaintext, which we deliberately did not propagate.
+
+### Sync strategy
+
+Full pull + upsert by PK every night. The original ask was a 7-day rolling window, but the `created_at` column in the lead tables is stored as M/D/YYYY *text* which doesn't sort lexically — so a clean server-side range filter isn't possible. Pulling everything is the simplest correct alternative and fits well within Lambda budget at current scale (~70k rows × 2 lead tables ≈ ~1 minute total wall time).
+
+The lead tables parse `created_at` text into a real `DATE` column called `lead_date`, and keep the original string in `created_at_raw` for forensic debugging.
+
+### Failure mode
+
+Per-table failures are isolated — a 500 from Supabase or a constraint violation on one table does NOT abort the other six. Each table's outcome is written to `supabase_sync_state`. If ANY table failed, the Lambda returns `statusCode: 500` so a CloudWatch alarm can flag the run.
+
+### Common SQL
+
+```sql
+-- Last sync health
+SELECT table_name, last_status, last_synced_at, last_row_count, last_error
+FROM supabase_sync_state
+ORDER BY last_synced_at DESC;
+
+-- Per-client per-day counts on both sides (phase-2 preview)
+SELECT
+    f.sub_account_id,
+    f.sub_account_name,
+    f.lead_date,
+    COUNT(DISTINCT f.lead_id) AS fb_count,
+    COUNT(DISTINCT h.lead_id) AS hl_count
+FROM supabase_facebook_lead f
+FULL OUTER JOIN supabase_highlevel_lead h
+    ON f.sub_account_id = h.sub_account_id
+   AND f.lead_date      = h.lead_date
+GROUP BY 1, 2, 3
+ORDER BY 3 DESC, 1;
+```
+
+### Phase 2 (not yet built)
+
+Compare view (FB vs GHL per client/day), Google Sheet write to `1TR2SQxtmawOat-VXiuOqo94vsMyLEjLsnjeK4ygNwqs` (tab `Status`), and integration-break threshold logic. Sheet is shared with the same service account used by `gymlaunch-mb-capacity-sheet-sync` (`n8n-sheets-integration@zsign-transfer.iam.gserviceaccount.com`).
+
+Open questions blocking phase 2:
+- Threshold for "Integration Break" vs "In Sync" (strict equality vs tolerance of N)
+- Whether to preserve the "system user" / "non-system user" distinction from the old workflow
+- How to display all-zero-on-both-sides days (In Sync vs No Activity vs filter out)
+
+---
+
+## Lead-DB2 Sheet Sync
+
+**Lambda:** `gymlaunch-lead_db2-sheet-sync`
+**Schedule:** `cron(0 7 * * ? *)` — daily at 07:00 UTC (1 hour before `gymlaunch-supabase-lead-sync`).
+**Source:** `src/sync/lead_db2_sheet/`
+**Sheet:** `Lead Integration Database V2.0`, tab `00 - Database` (sheet ID `1JGdbjR1g8MF0zzraOwyPNNY7-jRrVIzk2ZZI-FWhky0`).
+**RDS destination:** `client_lead_master`.
+
+### Why it exists
+
+The `00 - Database` tab is the operational client master for the FB-lead pipeline. Every client (FB page ↔ GHL location pairing) has one row in it. It carries:
+
+1. **Auto-populated fields** — written by the n8n workflow `00 - Main Workflow` (the FB leadgen webhook receiver) on every lead arrival, via `appendOrUpdate` keyed on `facebook_page_id`. Covers the 12 identifier and status columns.
+2. **Manually-maintained diagnostic fields** — 10 columns the team edits by hand: `system_user` (Yes/No), `fb_app_status`, `ghl_connection`, `workflow_connection`, `page_connection`, `lead_access_issue`, `ghl_snapshot`, `notes`, `lead_forms`, `supabase`.
+
+The phase-2 compare sheet needs `system_user` (and likely other diagnostic flags) per row. Nothing else in our data lake carries that data — it lives only in this sheet. So we mirror the whole sheet daily into `client_lead_master` and let humans keep editing the sheet exactly as before.
+
+**Column rename note:** the sheet's `system_user` column maps to `is_system_user` in RDS, because `SYSTEM_USER` became a reserved keyword in PostgreSQL 16 (SQL:2023 — returns the authenticated session user). The Lambda handles the rename when ingesting. Sheet column names are unchanged from the team's perspective.
+
+### What gets synced
+
+All 22 sheet columns. `hl_sub_account_api_key` is mirrored as plaintext as of migration 011 — needed for future per-client GHL automation. Hardening to Secrets Manager is tracked in `docs/future_work.md` under "Harden GHL API key storage."
+
+### Sheet access
+
+The Google service account `n8n-sheets-integration@zsign-transfer.iam.gserviceaccount.com` must have at least Viewer access on the sheet. If sync starts returning 403s, check the share list. Same service account already has Editor on the MB capacity sheet.
+
+### Failure mode
+
+If the sheet's header row gets renamed, the Lambda fails LOUDLY (`RuntimeError: Sheet is missing expected header columns: [...]`) rather than silently writing NULLs. State row in `supabase_sync_state` marks `last_status='error'` with the diff so an operator can spot it.
+
+### Common SQL
+
+```sql
+-- Counts by is_system_user / asana_status combo
+SELECT is_system_user, asana_status, COUNT(*)
+FROM client_lead_master
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+-- Clients flagged as non-system-user candidates (fb_app_status = 'Error')
+SELECT client_name, gym_name, fb_app_status, is_system_user, asana_status
+FROM client_lead_master
+WHERE fb_app_status = 'Error'
+ORDER BY client_name;
+
+-- Last sync result
+SELECT last_synced_at, last_row_count, last_status, last_error
+FROM supabase_sync_state
+WHERE table_name = 'client_lead_master';
+```
+
+---
+
+## Future Work
+
+Deferred work lives in [`docs/future_work.md`](future_work.md) — a per-entry
+list with capture date, why we deferred, and the trigger condition for picking
+it back up. Currently tracked there:
+
+- **Replace the n8n FB-lead pipeline** — bringing the FB → GHL forwarder
+  on-platform. The upstream `00 - Main Workflow` is load-bearing, not just a
+  monitor; replacing it is a multi-Lambda migration. Phase-2 compare doubles
+  as the safety net for this.
+- **Harden GHL API key storage** — currently plaintext in
+  `client_lead_master.hl_sub_account_api_key`. Move to Secrets Manager
+  (Option B2) when team grows or when `pg_dump` exposure becomes a concern.
 
 ---
 
