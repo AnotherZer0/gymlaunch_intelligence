@@ -16,6 +16,12 @@ SLACK_BOT_TOKEN=$(aws secretsmanager get-secret-value \
   --query SecretString --output text \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['bot_token'])")
 
+# Shared secret guarding the gymlaunch-add-slack-channel Function URL.
+CHANNEL_ADD_API_KEY=$(aws secretsmanager get-secret-value \
+  --secret-id gymlaunch/slack/channel_add_key \
+  --query SecretString --output text \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['api_key'])")
+
 ASANA_TOKEN=$(aws secretsmanager get-secret-value \
   --secret-id gymlaunch/asana/token \
   --query SecretString --output text \
@@ -103,7 +109,8 @@ sam deploy \
     "SesToAddress=${SES_TO_ADDRESS}" \
     "SupabaseUrl=${SUPABASE_URL}" \
     "SupabaseServiceRoleKey=${SUPABASE_SERVICE_ROLE_KEY}" \
-    "LeadDb2SheetId=${LEAD_DB2_SHEET_ID}"
+    "LeadDb2SheetId=${LEAD_DB2_SHEET_ID}" \
+    "ChannelAddApiKey=${CHANNEL_ADD_API_KEY}"
 
 echo "Setting log retention..."
 set_retention() {
@@ -114,6 +121,7 @@ set_retention /aws/lambda/gymlaunch-slack-sync
 set_retention /aws/lambda/gymlaunch-asana-agency-board-sync
 set_retention /aws/lambda/gymlaunch-asana-agency-board-deep-sync
 set_retention /aws/lambda/gymlaunch-sync-agency-board-to-hubspot
+set_retention /aws/lambda/gymlaunch-sync-hubspot-to-agency-board
 set_retention /aws/lambda/gymlaunch-mb-capacity-sheet-sync
 set_retention /aws/lambda/gymlaunch-sms-interceptor
 set_retention /aws/lambda/gymlaunch-phone-validator
@@ -122,5 +130,6 @@ set_retention /aws/lambda/gymlaunch-stripe-finance-report
 set_retention /aws/lambda/gymlaunch-project-note-sync
 set_retention /aws/lambda/gymlaunch-supabase-lead-sync
 set_retention /aws/lambda/gymlaunch-lead_db2-sheet-sync
+set_retention /aws/lambda/gymlaunch-add-slack-channel
 
 echo "Done."

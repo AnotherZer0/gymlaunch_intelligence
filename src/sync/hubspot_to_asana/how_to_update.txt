@@ -1,0 +1,109 @@
+HUBSPOT -> ASANA COACH SYNC   (gymlaunch-sync-hubspot-to-agency-board)
+======================================================================
+
+WHAT IT DOES
+------------
+Once a day, copies the COACH from HubSpot onto the Asana agency-board card,
+in one direction only:
+
+    HubSpot company.coach (a HubSpot user id)  ->  database  ->  Asana "Coach"
+
+It NEVER writes to HubSpot and NEVER clears anything. The "Agency Pro clears
+the HubSpot coach" rule lives in the OTHER sync (the hourly outbound one,
+gymlaunch-sync-agency-board-to-hubspot) and is untouched by this Lambda.
+
+Schedule: rate(1 day)
+Source:   src/sync/hubspot_to_asana/handler.py
+Column:   asana_agency_board_task.hs_coach  (migration 012)
+
+
+THE TWO STAGES (one daily run, in order)
+----------------------------------------
+Stage 1  HubSpot -> DB
+  Reads `coach` for every linked company, turns the HubSpot user id into a
+  name using COACH_BY_HUBSPOT_USER_ID, and stores the name in hs_coach.
+  - empty coach in HubSpot      -> left alone (this is what protects Agency Pro)
+  - user id not in the map      -> skipped + logged (add it to the map)
+
+Stage 2  DB -> Asana
+  Writes hs_coach onto the Asana "Coach" field, but only when:
+  - it differs from the live Asana value (hs_coach != coach), AND
+  - the card is NOT already "Agency Pro".
+  Comparing against `coach` (the hourly mirror of Asana) means a quiet day does
+  ZERO Asana writes. It also means HubSpot ALWAYS WINS: if someone hand-edits the
+  coach on a card in Asana, the next daily run puts it back to HubSpot's value.
+
+
+THE MAP YOU EDIT WHEN COACHES CHANGE  (the only thing you normally touch)
+-------------------------------------------------------------------------
+At the top of handler.py:
+
+    COACH_BY_HUBSPOT_USER_ID = {
+        "75556992": "Ryan",
+        "65419567": "RE",
+        "1080854659": "RE",          # RE has a second HubSpot user id; ~66 companies use it
+        "75559001": "Matt M",
+        "75559000": "Blake",
+        "75558999": "Rod",
+        "75558917": "LAUNCH - Mik",  # Mikealea
+    }
+
+  left  = the HubSpot user id the company `coach` field returns
+  right = the Asana "Coach" dropdown option name (must match Asana exactly)
+
+NOTE: a coach can have more than one HubSpot user id (RE does). If the dry run /
+logs report an "unmapped" id, look it up and add it pointing at the same name.
+
+To add a coach:
+  1. In HubSpot, find the user's id (the number the `coach` field stores).
+  2. Make sure the Asana "Coach" dropdown has an option with the exact name.
+  3. Add the "id": "Name" line here.
+  4. Redeploy: bash scripts/deploy.sh
+
+To remove a coach: delete their line (existing cards keep their value until
+HubSpot changes).
+
+
+PROTECTED ASANA VALUES (never overridden from HubSpot)
+------------------------------------------------------
+PROTECTED_ASANA_COACHES = {"Agency Pro", "Alliance"}
+
+If a card's current Asana coach is one of these, Stage 2 skips it — HubSpot never
+overwrites it. These are Asana-only designations, not real HubSpot coaches.
+
+- Agency Pro also stays safe a second way: the outbound hourly sync empties
+  HubSpot's coach for Agency Pro clients, so Stage 1 sees "empty" and changes
+  nothing anyway.
+- "Alliance" is protected pending a decision from the team on what it should do.
+- "LAUNCH - Mik" is NOT protected — Mikealea is a real HubSpot coach, so she's in
+  the map above and synced normally.
+
+To protect another value, add its exact Asana option name to the set + redeploy.
+
+
+FIELD FACTS (rarely change)
+---------------------------
+- HubSpot property internal name: "coach" (company object, type "HubSpot user")
+- Asana field: "Coach", GID 1206012401384430, type multi_enum (multi-select)
+  Because it's multi-select, the write sends a LIST of option ids. HubSpot only
+  holds ONE coach, so we send a single-item list, which REPLACES the card's
+  coach selection. A card can't be driven to two coaches from HubSpot.
+- Option names are matched case-insensitively, so the map just needs the name.
+
+
+SYNCING A DIFFERENT / SECOND FIELD LATER
+----------------------------------------
+This handler is coach-specific on purpose. For another field, clone the
+directory into a clearly-named second Lambda (confirm the name with Daniel
+first — standing rule), add its own DB columns via a new migration, and adjust
+the map + field config. Do NOT also push the same field from the outbound sync,
+or the two directions will fight.
+
+
+DEPLOY
+------
+1. Run migration 012 against the database (adds hs_coach).
+2. bash scripts/deploy.sh
+
+The deploy user cannot delete Lambdas, so a rename would orphan the old one —
+delete it manually in the Lambda console if you ever rename this.

@@ -34,6 +34,7 @@ but changing it would require tearing down and recreating all resources, so it s
 | `gymlaunch-asana-agency-board-sync` | Every hour, top of hour | `src/sync/asana/agency_board/` |
 | `gymlaunch-asana-agency-board-deep-sync` | Once daily | `src/sync/asana/deep/` |
 | `gymlaunch-sync-agency-board-to-hubspot` | Every hour, :10 past | `src/sync/hubspot/` |
+| `gymlaunch-sync-hubspot-to-agency-board` | Once daily | `src/sync/hubspot_to_asana/` |
 | `gymlaunch-mb-capacity-sheet-sync` | 8am, 12pm, 4pm, 8pm EDT | `src/sync/sheets/` |
 | `gymlaunch-sms-interceptor` | HTTP webhook (API Gateway) | `src/sms/interceptor/` |
 | `gymlaunch-phone-validator` | HTTP webhook (API Gateway) | `src/phone/validator/` |
@@ -42,6 +43,7 @@ but changing it would require tearing down and recreating all resources, so it s
 | `gymlaunch-fathom-webhook` | HTTP webhook (API Gateway) | `src/fathom/webhook/` |
 | `gymlaunch-supabase-lead-sync` | Daily at 08:00 UTC (2am CST / 3am CDT) | `src/sync/supabase_leads/` |
 | `gymlaunch-lead_db2-sheet-sync` | Daily at 07:00 UTC (one hour before supabase-lead-sync) | `src/sync/lead_db2_sheet/` |
+| `gymlaunch-add-slack-channel` | Function URL (on-demand, HubSpot-triggered) | `src/slack/add_channel/` |
 
 All functions run in the VPC (subnets `subnet-a085c381`, `subnet-3d566b33`) so they can reach RDS.  
 All share IAM role `gymlaunch-slack-sync` (role named after first Lambda — same naming quirk as stack).  
@@ -54,6 +56,7 @@ Permissions boundary: `gymlaunch-lambda-boundary`.
 /aws/lambda/gymlaunch-asana-agency-board-sync
 /aws/lambda/gymlaunch-asana-agency-board-deep-sync
 /aws/lambda/gymlaunch-sync-agency-board-to-hubspot
+/aws/lambda/gymlaunch-sync-hubspot-to-agency-board
 /aws/lambda/gymlaunch-mb-capacity-sheet-sync
 /aws/lambda/gymlaunch-sms-interceptor
 /aws/lambda/gymlaunch-phone-validator
@@ -62,6 +65,7 @@ Permissions boundary: `gymlaunch-lambda-boundary`.
 /aws/lambda/gymlaunch-fathom-webhook
 /aws/lambda/gymlaunch-supabase-lead-sync
 /aws/lambda/gymlaunch-lead_db2-sheet-sync
+/aws/lambda/gymlaunch-add-slack-channel
 ```
 
 Retention: 30 days (set by deploy script).
@@ -84,6 +88,7 @@ All secrets are in `us-east-1`.
 | `gymlaunch/fathom/Fathom-Webhook-Secret` | `secret` | `gymlaunch-fathom-webhook` |
 | `gymlaunch/stripe/api_keys` | _(raw JSON)_ | `gymlaunch-stripe-finance-report` |
 | `gymlaunch/supabase/api` | `url` + `service_role_key` (raw JSON) | `gymlaunch-supabase-lead-sync` |
+| `gymlaunch/slack/channel_add_key` | `api_key` | `gymlaunch-add-slack-channel` (Function URL secret) |
 
 The Google service account JSON is base64-encoded by deploy.sh and passed as
 `GOOGLE_SERVICE_ACCOUNT_B64`. It must have Editor access to the Google Sheet.
