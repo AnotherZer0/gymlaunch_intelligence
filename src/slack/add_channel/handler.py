@@ -37,6 +37,11 @@ from slack_sdk.errors import SlackApiError
 
 MAX_RESPONSE_CHARS = 256
 
+# Debug switch — set env var DEBUG=1 (in the console) to make the handler RETURN and log
+# exactly what it received (key length, source, first differing char vs the expected key,
+# raw query) instead of doing the work. Turn it OFF (remove or set 0) when finished.
+DEBUG = os.environ.get("DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
 
 # --- Connections ---
 
@@ -91,11 +96,43 @@ def extract_inputs(event: dict):
     return api_key, (channel or "").strip()
 
 
+def debug_report(event, api_key, expected) -> str:
+    """Describe exactly what the handler received (DEBUG mode). Reveals at most one
+    character of the expected key, so it never dumps the secret."""
+    qs = event.get("queryStringParameters") or {}
+    hdrs = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    source = "header" if hdrs.get("x-api-key") else ("query" if qs.get("key") else "none")
+    recv = api_key or ""
+    diff = "exact match"
+    if recv != expected:
+        n = min(len(recv), len(expected))
+        i = next((j for j in range(n) if recv[j] != expected[j]), n)
+        if i < n:
+            diff = f"first diff at index {i}: received {recv[i]!r} vs expected {expected[i]!r}"
+        else:
+            diff = f"common prefix matches; lengths differ (recv={len(recv)}, exp={len(expected)})"
+    return (
+        f"source={source} recv_key_len={len(recv)} expected_key_len={len(expected)} "
+        f"match={recv == expected} | {diff} | "
+        f"rawQuery={event.get('rawQueryString')!r} queryKeys={list(qs.keys())} "
+        f"x_api_key_header_present={'x-api-key' in hdrs}"
+    )
+
+
 # --- Entry point ---
 
 def lambda_handler(event, context):
     expected = os.environ.get("CHANNEL_ADD_API_KEY", "")
     api_key, channel_id = extract_inputs(event)
+
+    if DEBUG:
+        report = debug_report(event, api_key, expected)
+        print("DEBUG event:", json.dumps(event)[:2000])
+        print("DEBUG:", report)
+        # Return the full report (not truncated) so it lands in the HubSpot output field.
+        return {"statusCode": 200,
+                "headers": {"Content-Type": "text/plain; charset=utf-8"},
+                "body": "DEBUG " + report}
 
     if not expected or api_key != expected:
         return reply("ERROR: unauthorized (bad or missing key)")

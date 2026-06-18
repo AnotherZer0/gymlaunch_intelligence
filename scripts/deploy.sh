@@ -16,12 +16,6 @@ SLACK_BOT_TOKEN=$(aws secretsmanager get-secret-value \
   --query SecretString --output text \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['bot_token'])")
 
-# Shared secret guarding the gymlaunch-add-slack-channel Function URL.
-CHANNEL_ADD_API_KEY=$(aws secretsmanager get-secret-value \
-  --secret-id gymlaunch/slack/channel_add_key \
-  --query SecretString --output text \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['api_key'])")
-
 ASANA_TOKEN=$(aws secretsmanager get-secret-value \
   --secret-id gymlaunch/asana/token \
   --query SecretString --output text \
@@ -109,8 +103,7 @@ sam deploy \
     "SesToAddress=${SES_TO_ADDRESS}" \
     "SupabaseUrl=${SUPABASE_URL}" \
     "SupabaseServiceRoleKey=${SUPABASE_SERVICE_ROLE_KEY}" \
-    "LeadDb2SheetId=${LEAD_DB2_SHEET_ID}" \
-    "ChannelAddApiKey=${CHANNEL_ADD_API_KEY}"
+    "LeadDb2SheetId=${LEAD_DB2_SHEET_ID}"
 
 echo "Setting log retention..."
 set_retention() {
@@ -130,6 +123,8 @@ set_retention /aws/lambda/gymlaunch-stripe-finance-report
 set_retention /aws/lambda/gymlaunch-project-note-sync
 set_retention /aws/lambda/gymlaunch-supabase-lead-sync
 set_retention /aws/lambda/gymlaunch-lead_db2-sheet-sync
+# gymlaunch-add-slack-channel is managed manually (not in the SAM stack — see template.yaml),
+# but we still set log retention on it here for hygiene.
 set_retention /aws/lambda/gymlaunch-add-slack-channel
 
 echo "Done."

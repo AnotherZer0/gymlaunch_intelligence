@@ -43,11 +43,17 @@ but changing it would require tearing down and recreating all resources, so it s
 | `gymlaunch-fathom-webhook` | HTTP webhook (API Gateway) | `src/fathom/webhook/` |
 | `gymlaunch-supabase-lead-sync` | Daily at 08:00 UTC (2am CST / 3am CDT) | `src/sync/supabase_leads/` |
 | `gymlaunch-lead_db2-sheet-sync` | Daily at 07:00 UTC (one hour before supabase-lead-sync) | `src/sync/lead_db2_sheet/` |
-| `gymlaunch-add-slack-channel` | Function URL (on-demand, HubSpot-triggered) | `src/slack/add_channel/` |
+| `gymlaunch-add-slack-channel` | Function URL (on-demand, HubSpot-triggered) — **manually managed, see note** | `src/slack/add_channel/` |
 
 All functions run in the VPC (subnets `subnet-a085c381`, `subnet-3d566b33`) so they can reach RDS.  
 All share IAM role `gymlaunch-slack-sync` (role named after first Lambda — same naming quirk as stack).  
 Permissions boundary: `gymlaunch-lambda-boundary`.
+
+**Note — `gymlaunch-add-slack-channel` is NOT in the SAM stack.** The deploy IAM user
+cannot create Lambda Function URLs (`lambda:CreateFunctionUrlConfig` isn't granted, and
+`lambda:AddPermission` is limited to the `events`/`apigateway` principals). So this function
+is managed manually: code in `src/slack/add_channel/` pushed via `aws lambda update-function-code`,
+and its Function URL + public permission added in the console. `deploy.sh` only sets its log retention.
 
 ### CloudWatch Log Groups
 

@@ -61,10 +61,6 @@ Parameters:
   LeadDb2SheetId:
     Type: String
     Description: "Google Sheet ID for the `Lead Integration Database V2.0` workbook (contains the `00 - Database` master client tab)."
-  ChannelAddApiKey:
-    Type: String
-    NoEcho: true
-    Description: "Shared secret guarding the gymlaunch-add-slack-channel Function URL. Sent as x-api-key header or ?key= query param."
 
 Globals:
   Function:
@@ -232,26 +228,12 @@ Resources:
             Name: gymlaunch-asana-agency-board-deep-sync-daily
             Enabled: true
 
-  # Add-only endpoint: registers a Slack channel for syncing. Triggered by a
-  # HubSpot property update firing the channel id at the Function URL.
-  AddSlackChannelFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: gymlaunch-add-slack-channel
-      CodeUri: ../src/slack/add_channel/
-      Handler: handler.lambda_handler
-      Role: !GetAtt SlackSyncRole.Arn
-      Timeout: 29
-      Environment:
-        Variables:
-          SLACK_BOT_TOKEN: !Ref SlackBotToken
-          CHANNEL_ADD_API_KEY: !Ref ChannelAddApiKey
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref DbSecurityGroupId
-        SubnetIds: !Ref SubnetIds
-      FunctionUrlConfig:
-        AuthType: NONE
+  # NOTE: gymlaunch-add-slack-channel is intentionally NOT defined here. The
+  # deploy IAM user cannot create Lambda Function URLs (lambda:CreateFunctionUrlConfig
+  # is not granted, and AddPermission is limited to the events/apigateway principals),
+  # so that function is managed manually in the console: its code lives in
+  # src/slack/add_channel/ and is pushed with `aws lambda update-function-code`,
+  # and its Function URL + public permission are added via the console.
 
   # API Gateway for Twilio webhooks (inbound messages + status callbacks).
   # Both routes are handled by a single Lambda to share the HubSpot client and DB connection.
@@ -480,8 +462,5 @@ Outputs:
   SmsApiUrl:
     Value: !Sub "https://${SmsApi}.execute-api.${AWS::Region}.amazonaws.com"
     Description: "Base URL for Twilio webhooks — append /sms/inbound and /sms/status"
-  AddSlackChannelUrl:
-    Value: !GetAtt AddSlackChannelFunctionUrl.FunctionUrl
-    Description: "POST a Slack channel id here (with x-api-key) to register it for syncing"
   RoleArn:
     Value: !GetAtt SlackSyncRole.Arn
