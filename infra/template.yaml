@@ -260,7 +260,7 @@ Resources:
           # Format: {"ChannelName": ["+1XXXXXXXXXX", ...], ...}
           # Channel names must match the internal names in the sms_subscriptions HubSpot property.
           # After editing, run: bash scripts/deploy.sh
-          TWILIO_NUMBER_CHANNELS: '{"Marketing": ["+12135661157", "+12135613526", "+12135795481"]}'
+          TWILIO_NUMBER_CHANNELS: '{"Marketing": ["+12135661157", "+12135613526", "+12135795481","+17277883639"]}'
       VpcConfig:
         SecurityGroupIds:
           - !Ref DbSecurityGroupId
