@@ -41,15 +41,17 @@ but changing it would require tearing down and recreating all resources, so it s
 | `gymlaunch-stripe-finance-report` | M-F at 10am Central (15:00 UTC) | `src/sync/stripe/finance_report/` |
 | `gymlaunch-project-note-sync` | Every 72 hours | `src/sync/hubspot_project_notes/` |
 | `gymlaunch-fathom-webhook` | HTTP webhook (API Gateway) | `src/fathom/webhook/` |
+| `gymlaunch-fathom-daily-sync` | Daily at 04:00 UTC (11pm CDT) | `src/fathom/sync/` |
 | `gymlaunch-supabase-lead-sync` | Daily at 08:00 UTC (2am CST / 3am CDT) | `src/sync/supabase_leads/` |
 | `gymlaunch-lead_db2-sheet-sync` | Daily at 07:00 UTC (one hour before supabase-lead-sync) | `src/sync/lead_db2_sheet/` |
 | `gymlaunch-add-slack-channel` | Function URL (on-demand, HubSpot-triggered) — **manually managed, see note** | `src/slack/add_channel/` |
+| `gymlaunch-sf-create-custom-weekly-sub-for-go-product` | Function URL (on-demand) — **manually managed, see note** | `src/subscriptionflow/create_sub/` |
 
 All functions run in the VPC (subnets `subnet-a085c381`, `subnet-3d566b33`) so they can reach RDS.  
 All share IAM role `gymlaunch-slack-sync` (role named after first Lambda — same naming quirk as stack).  
 Permissions boundary: `gymlaunch-lambda-boundary`.
 
-**Note — `gymlaunch-add-slack-channel` is NOT in the SAM stack.** The deploy IAM user
+**Note — `gymlaunch-add-slack-channel` and `gymlaunch-sf-create-custom-weekly-sub-for-go-product` are NOT in the SAM stack.** The deploy IAM user
 cannot create Lambda Function URLs (`lambda:CreateFunctionUrlConfig` isn't granted, and
 `lambda:AddPermission` is limited to the `events`/`apigateway` principals). So this function
 is managed manually: code in `src/slack/add_channel/` pushed via `aws lambda update-function-code`,
@@ -69,9 +71,11 @@ and its Function URL + public permission added in the console. `deploy.sh` only 
 /aws/lambda/gymlaunch-stripe-finance-report
 /aws/lambda/gymlaunch-project-note-sync
 /aws/lambda/gymlaunch-fathom-webhook
+/aws/lambda/gymlaunch-fathom-daily-sync
 /aws/lambda/gymlaunch-supabase-lead-sync
 /aws/lambda/gymlaunch-lead_db2-sheet-sync
 /aws/lambda/gymlaunch-add-slack-channel
+/aws/lambda/gymlaunch-sf-create-custom-weekly-sub-for-go-product
 ```
 
 Retention: 30 days (set by deploy script).
@@ -95,6 +99,8 @@ All secrets are in `us-east-1`.
 | `gymlaunch/stripe/api_keys` | _(raw JSON)_ | `gymlaunch-stripe-finance-report` |
 | `gymlaunch/supabase/api` | `url` + `service_role_key` (raw JSON) | `gymlaunch-supabase-lead-sync` |
 | `gymlaunch/slack/channel_add_key` | `api_key` | `gymlaunch-add-slack-channel` (Function URL secret) |
+| `gymlaunch/fathom/Fathom-API-Key` | `api_key` | `gymlaunch-fathom-sync` (nightly sync, in progress) |
+| `gymlaunch/subscriptionflow/api` | `client_id`, `client_secret`, `endpoint_api_key` | `gymlaunch-sf-create-custom-weekly-sub-for-go-product` |
 
 The Google service account JSON is base64-encoded by deploy.sh and passed as
 `GOOGLE_SERVICE_ACCOUNT_B64`. It must have Editor access to the Google Sheet.
@@ -125,6 +131,8 @@ The Google service account JSON is base64-encoded by deploy.sh and passed as
 | `db/migrations/009_supabase_lead_sync_schema.sql` | 7 `supabase_*` mirror tables + `supabase_sync_state` |
 | `db/migrations/010_client_lead_master_schema.sql` | `client_lead_master` — mirror of `00 - Database` sheet |
 | `db/migrations/011_client_lead_master_add_api_key.sql` | Adds `hl_sub_account_api_key` column to `client_lead_master` |
+| `db/migrations/012_hubspot_coach_sync.sql` | Adds `hs_coach` column to `asana_agency_board_task` for HubSpot→Asana coach sync |
+| `db/migrations/013_subscriptionflow_schema.sql` | `subscriptionflow_oauth_token` table (singleton OAuth2 token cache) |
 
 ### Key Tables
 
@@ -149,6 +157,7 @@ The Google service account JSON is base64-encoded by deploy.sh and passed as
 | `supabase_facebook_lead_form` | Mirror of Supabase `Facebook Lead Form Database`. Legacy, near-empty. |
 | `supabase_facebook_lead_legacy` | Mirror of Supabase `Facebook Leads Database`. Predecessor of `supabase_facebook_lead` with different column names. |
 | `supabase_sync_state` | Per-table sync watermark — last run timestamp, row count, success/error status. PK: `table_name`. Despite the name, used as the generic state table by both `gymlaunch-supabase-lead-sync` and `gymlaunch-lead_db2-sheet-sync`. |
+| `subscriptionflow_oauth_token` | Singleton OAuth2 access token cache for SubscriptionFlow API. Rotated in-band (proactive on expiry + reactive on 401). |
 | `client_lead_master` | Mirror of the `00 - Database` tab in the `Lead Integration Database V2.0` Google Sheet. Carries both auto-written fields (basic FB/GHL/Asana identifiers, populated by the n8n FB-lead workflow) and 10 manually-maintained diagnostic flags including `is_system_user` (Yes/No — sheet header is `system_user`, renamed because that's a PG 16+ reserved word), `fb_app_status`, `ghl_connection`. PK: `facebook_page_id`. Includes `hl_sub_account_api_key` (plaintext) as of migration 011 — future hardening tracked in `docs/future_work.md`. |
 
 ### Key Views
@@ -227,6 +236,12 @@ How to add new HubSpot fields: `src/sync/hubspot/how_to_update.txt`
 The deploy user has `ExplicitDenyDangerous` which blocks `lambda:DeleteFunction`.
 This means renaming a Lambda in the template leaves the old one orphaned — it must be
 deleted manually from the Lambda console.
+
+The deploy user also cannot create Lambda Function URLs (`lambda:CreateFunctionUrlConfig`
+not granted). So any Lambda needing a Function URL must be manually managed: code
+deployed via `aws lambda update-function-code`, URL + permission added in the console.
+Currently applies to `gymlaunch-add-slack-channel` and
+`gymlaunch-sf-create-custom-weekly-sub-for-go-product`.
 
 ---
 
@@ -673,6 +688,40 @@ Uses `pg_try_advisory_lock(hashtext('project_note_sync'))` to prevent overlappin
 
 ## Fathom
 
+### gymlaunch-fathom-daily-sync
+
+Nightly sync against the Fathom API. Pulls meetings and upserts into `fathom_call` + `fathom_call_invitee`.
+
+**Normal run (scheduled):** fetches meetings created in the last 48 hours using the `created_after` param.
+Skips meetings already in DB with a non-null `transcript_plaintext`.
+
+**Full sync:** set `FULL_SYNC=true` in the Lambda console env vars, then invoke manually (or wait for the
+scheduled run). Fetches ALL meetings with no date filter, skipping ones already fully stored. Set back
+to `false` afterward (a deploy also resets it).
+
+Both runs use `include_transcript=true` on the `/meetings` list endpoint — transcripts come back inline,
+no separate per-meeting API calls needed. Upsert uses `COALESCE` on `transcript_plaintext` so an existing
+transcript is never overwritten with NULL.
+
+API: `GET https://api.fathom.ai/external/v1/meetings` — cursor-based pagination (`next_cursor` / `cursor`),
+meetings wrapped in `items`, 60 req/min rate limit.
+API key: `gymlaunch/fathom/Fathom-API-Key` (key: `api_key`), passed as `X-Api-Key` header.
+
+**To manually invoke (e.g. for a backfill):**
+```bash
+aws lambda invoke \
+  --function-name gymlaunch-fathom-daily-sync \
+  --invocation-type RequestResponse \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{}' \
+  /tmp/out.json && cat /tmp/out.json
+```
+
+**First run (full backfill):**
+1. Set `FULL_SYNC=true` in the Lambda console env vars
+2. Invoke manually (or wait for the 4am UTC schedule)
+3. Set `FULL_SYNC` back to `false`
+
 ### gymlaunch-fathom-webhook
 
 Receives call transcript payloads fired by Zapier after each Fathom-recorded call.
@@ -699,6 +748,32 @@ ORDER BY fc.meeting_scheduled_start_time DESC;
 ```
 
 See `src/fathom/webhook/how_to_query.txt` for full query reference.
+
+---
+
+## SubscriptionFlow
+
+**Lambda:** `gymlaunch-sf-create-custom-weekly-sub-for-go-product`
+**Trigger:** Function URL (on-demand) — **manually managed** (deploy user can't create Function URLs)
+**Source:** `src/subscriptionflow/create_sub/`
+**Secret:** `gymlaunch/subscriptionflow/api` — JSON with keys `client_id`, `client_secret`, `endpoint_api_key`
+
+Creates a 1-year Termed (fixed-term, ends after 1 year) weekly subscription for the GO product in
+SubscriptionFlow. Accepts a JSON POST with `id` (SF customer ID) or `email`, plus optional `price`.
+Auth: `x-api-key` header or `?key=` query param matching `endpoint_api_key`.
+
+SubscriptionFlow uses OAuth2 client-credentials. The bearer token is cached in `subscriptionflow_oauth_token`
+(singleton, migration 013) and rotated in-band — proactively on expiry, reactively on 401.
+
+`pay_invoice` is OFF — invoice is left in DUE state so SF doesn't auto-charge. Price defaults to 0.00
+when omitted (intentional — fix after the fact as needed). Weekly cadence comes from the SF plan config,
+NOT the payload — confirm plan `f359c92d-...` is configured as a weekly plan in the SF dashboard.
+
+**DEBUG dry-run:** set env var `DEBUG=1` in the Lambda console to make it authenticate + look up the
+customer READ-ONLY and return the subscription body it WOULD post. Resets to "0" on next deploy.
+
+**Watch-outs:** see `docs/future_work.md` SubscriptionFlow entry for known gaps (price hardening,
+plan registry, renewal_type field confirmed only as `"Renew with Specific Term"`).
 
 ---
 

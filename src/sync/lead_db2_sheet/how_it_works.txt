@@ -1,0 +1,292 @@
+================================================================================
+ gymlaunch-lead_db2-sheet-sync — HOW THIS WORKS
+================================================================================
+
+WHAT IT IS
+----------
+A scheduled Lambda that, once a day, reads ONE tab of a Google Sheet and mirrors
+every row of it into an RDS (PostgreSQL) table. That's the whole job: copy the
+sheet into the database so the data is queryable in SQL.
+
+The sheet is "Lead Integration Database V2.0", the tab is "00 - Database", and
+the destination table is client_lead_master. One sheet row becomes one table row.
+
+This sheet is the operational "client master" for the FB-lead pipeline. Every
+client (one Facebook page paired to one GHL / HighLevel location) is one row.
+Nothing else in our data lake holds the hand-edited diagnostic flags that live in
+this sheet, so this Lambda is the only way that data reaches SQL.
+
+The Lambda is READ-ONLY on the sheet. It never writes back. Humans keep editing
+the sheet exactly as they always have; the Lambda just photographs it nightly.
+
+
+WHERE IT LIVES
+--------------
+  Lambda name:  gymlaunch-lead_db2-sheet-sync
+  Code:         src/sync/lead_db2_sheet/handler.py
+  Schedule:     cron(0 7 * * ? *)  — 07:00 UTC daily
+                Deliberately ONE HOUR BEFORE gymlaunch-supabase-lead-sync
+                (which runs at 08:00 UTC). The client master snapshot is fresh
+                before the lead mirror — and any phase-2 compare — reads it, so
+                each client's system_user flag is correct by the time it's needed.
+  Source sheet: "Lead Integration Database V2.0"
+                doc ID 1JGdbjR1g8MF0zzraOwyPNNY7-jRrVIzk2ZZI-FWhky0
+                tab    "00 - Database"
+  RDS table:    client_lead_master
+  State table:  supabase_sync_state  (row where table_name='client_lead_master')
+
+
+ENVIRONMENT VARIABLES (set by the SAM template / deploy)
+--------------------------------------------------------
+  GOOGLE_SERVICE_ACCOUNT_B64 .. The Google service-account JSON, base64-encoded.
+                                The Lambda base64-decodes it, parses the JSON, and
+                                authorizes gspread with it (read-only scope).
+  LEAD_DB2_SHEET_ID ........... The spreadsheet document ID (the long string above).
+  DB_HOST / DB_NAME / DB_USER / DB_PASSWORD .. Standard RDS connection settings.
+                                The Lambda connects over SSL with pg8000.
+
+The function runs inside the VPC (DbSecurityGroupId + SubnetIds) so it can reach
+RDS, same as the other sync Lambdas.
+
+
+THE GOOGLE SERVICE ACCOUNT (the thing that usually breaks)
+----------------------------------------------------------
+  Account:  n8n-sheets-integration@zsign-transfer.iam.gserviceaccount.com
+  Needs:    Viewer access (or higher) on the source sheet.
+  Scope:    https://www.googleapis.com/auth/spreadsheets.readonly
+
+If the sync suddenly starts failing with a 403 / permission error, the most likely
+cause is that the sheet stopped being shared with that account — someone changed
+the share list, or the sheet got copied to a new file. Re-add the service-account
+email as a Viewer and it heals. (This same account already has Editor on the MB
+capacity sheet, so it should already exist in the org's Google workspace.)
+
+
+THE TWO KINDS OF COLUMN IN THIS SHEET (important to understand)
+---------------------------------------------------------------
+The "00 - Database" tab is touched by two completely different writers, and the
+sync carries BOTH:
+
+  1. AUTO-POPULATED (12 columns) — written by the n8n workflow "00 - Main
+     Workflow", the load-bearing FB-leadgen webhook receiver. On every FB lead
+     arrival it does an appendOrUpdate keyed on facebook_page_id, filling in:
+       facebook_page_name, facebook_page_id, facebook_ad_account_id,
+       facebook_ad_account_name, hl_sub_account_location_id,
+       hl_sub_account_location_name, hl_sub_account_api_key, asana_task_id,
+       gym_name, client_name, asana_status, workflow_status
+
+  2. MANUALLY MAINTAINED (10 columns) — humans edit these by hand. They are
+     diagnostic flags that no automation writes, which is the whole reason this
+     sync has to exist:
+       system_user           (Yes/No — do we have FB Business Manager access)
+       fb_app_status         (used to filter the Non-System-User heatmap)
+       ghl_connection        (which agency GHL account is wired to the client)
+       workflow_connection   (e.g. "Make" / "No")
+       page_connection       (e.g. "Personal - Alex Burner")
+       lead_access_issue
+       ghl_snapshot
+       notes
+       lead_forms
+       supabase              (Yes/No — is this client in the new pipeline)
+
+That's 22 columns total, and the Lambda mirrors ALL 22. The exact list, in INSERT
+order, is the RDS_COLUMNS array in handler.py.
+
+
+THE ONE COLUMN-NAME RENAME (system_user -> is_system_user)
+----------------------------------------------------------
+There is EXACTLY ONE column whose name differs between the sheet and the table:
+
+  sheet header:  system_user
+  RDS column:    is_system_user
+
+Why: SYSTEM_USER became a RESERVED KEYWORD in PostgreSQL 16 (SQL:2023 — it returns
+the authenticated session user). A column literally named system_user would
+collide with that keyword and make queries ambiguous/awkward, so the table column
+is is_system_user instead.
+
+The Lambda handles this transparently. The mapping lives in one small dict:
+
+  SHEET_HEADER_OVERRIDES = { "is_system_user": "system_user" }
+
+and a helper sheet_header_for() that, for any RDS column, returns the sheet header
+to read from (the override if present, otherwise the same name). When the Lambda
+reads a row, it pulls the sheet's "system_user" cell and writes it into the table's
+is_system_user column. Every OTHER column has an identical name in both places.
+
+From the team's point of view nothing changed — they still see "system_user" in
+the sheet. The rename is invisible to them and only matters when you write SQL
+against client_lead_master (query is_system_user, not system_user).
+
+
+THE hl_sub_account_api_key COLUMN (plaintext — read this)
+---------------------------------------------------------
+hl_sub_account_api_key is the per-client GHL / HighLevel API key. It is mirrored
+into RDS in PLAINTEXT, as of migration 011. This is intentional for now — it's
+needed so future per-client GHL automation can read each location's key from SQL.
+
+This is tracked as a known hardening item: docs/future_work.md, entry "Harden GHL
+API key storage." If/when that work lands, the key moves to Secrets Manager and
+this Lambda stops mirroring the column. Until then, treat client_lead_master as
+sensitive (e.g. mind who can pg_dump it).
+
+
+WHAT A RUN DOES (step by step)
+------------------------------
+  1. Connect to RDS (SSL).
+
+  2. Take a Postgres ADVISORY LOCK keyed on "lead_db2_sheet_sync"
+     (pg_try_advisory_lock(hashtext('lead_db2_sheet_sync'))). This prevents two
+     runs overlapping — e.g. if someone manually invokes the Lambda right as the
+     07:00 cron fires. If the lock is already held, the run prints "Another
+     lead_db2 sheet sync is running, exiting" and returns 200 immediately. The
+     lock is released in a finally block at the end.
+
+  3. Authorize gspread with the service account, open the sheet by ID, open the
+     "00 - Database" worksheet, and call get_all_records(). That uses ROW 1 as the
+     header row and returns one dict per data row, keyed by header name.
+
+  4. HEADER GUARD (fail loud, not silent). The Lambda computes the set of headers
+     it expects (REQUIRED_SHEET_HEADERS — every column it mirrors, using the
+     sheet-side names, i.e. "system_user" not "is_system_user"). If any expected
+     header is missing from the sheet, it raises a RuntimeError naming exactly
+     which columns are missing and what headers it actually found. See the
+     dedicated section below for why this matters.
+
+  5. Skip empty / unkeyed rows. Any row whose facebook_page_id is blank is dropped
+     (it can't be upserted — facebook_page_id is the primary key). The count of
+     skipped rows is logged.
+
+  6. UPSERT the valid rows into client_lead_master, in batches of 200
+     (DB_UPSERT_BATCH_SIZE), committing after each batch. Each batch is a single
+     multi-row INSERT ... ON CONFLICT (facebook_page_id) DO UPDATE that re-writes
+     every non-key column from the sheet and sets synced_at = now(). Empty cells
+     ("" from gspread) are converted to SQL NULL before insert.
+
+  7. Record the run in supabase_sync_state (success path: last_status='success',
+     last_row_count = rows upserted, last_error = NULL). On any DB error it rolls
+     back, records last_status='error' with the error text, and re-raises so the
+     run shows as failed in CloudWatch.
+
+  8. Print a summary and return it, e.g.:
+       { "elapsed_seconds": 2.3, "fetched": 187, "skipped_empty": 4, "upserted": 183 }
+
+
+WHY THE UPSERT MAKES RE-RUNS SAFE
+---------------------------------
+client_lead_master has facebook_page_id as its primary key. The write is:
+
+  INSERT INTO client_lead_master (...) VALUES (...)
+  ON CONFLICT (facebook_page_id) DO UPDATE SET <every non-key column> = EXCLUDED.<col>,
+                                               synced_at = now()
+
+So each row is INSERTED if new and OVERWRITTEN if it already exists. Running the
+sync twice produces the same end state as running it once — it is idempotent. You
+can re-invoke it by hand any time without fear of duplicate rows or drift.
+
+Note the direction of truth: the SHEET wins. Every run overwrites the table's
+non-key columns with whatever the sheet currently says. Do not hand-edit
+client_lead_master and expect it to stick — the next 07:00 run will clobber it.
+Edit the sheet instead.
+
+
+WHY IT FAILS LOUDLY ON HEADER CHANGES (and what to do)
+------------------------------------------------------
+get_all_records() maps columns BY HEADER NAME. If a human renames a column in the
+sheet (say "system_user" becomes "System User" or "sys_user"), a naive sync would
+just write NULLs into that column forever and nobody would notice until the
+phase-2 compare looked wrong.
+
+To prevent that silent rot, the Lambda checks the sheet's header set against the
+columns it expects and RAISES if any are missing:
+
+  RuntimeError: Sheet '00 - Database' is missing expected header columns:
+                [...]. Found headers: [...]
+
+When you see this:
+  - Look at the "missing" vs "found" lists — they tell you exactly which header
+    drifted.
+  - Either rename the sheet column back to the expected name, OR (if the rename is
+    intentional) update RDS_COLUMNS / SHEET_HEADER_OVERRIDES in handler.py to
+    match, add a migration if a NEW column is involved, and redeploy.
+  - The failure is also recorded in supabase_sync_state as
+    last_status='error' with the diff, so an operator can spot it without reading
+    CloudWatch.
+
+Related gotcha: the header row IS row 1. If someone inserts a title/banner row at
+the very top of the sheet, row 1 stops being the headers and the guard will trip
+(or mis-map). Keep the headers on row 1.
+
+
+THE STATE TABLE (yes, it's named "supabase_sync_state")
+-------------------------------------------------------
+Per-run bookkeeping is written to supabase_sync_state, in the row where
+table_name = 'client_lead_master'. Despite the "supabase" in its name, this table
+is the GENERIC per-table sync watermark used across all our sync Lambdas, not just
+the Supabase one. Don't be thrown by the name.
+
+To check the last run:
+
+  SELECT last_synced_at, last_row_count, last_status, last_error
+  FROM supabase_sync_state
+  WHERE table_name = 'client_lead_master';
+
+last_status='success' with a recent last_synced_at = healthy. last_status='error'
+= read last_error for the reason (most often a header diff or a 403 on the sheet).
+
+
+HOW TO RUN IT BY HAND
+---------------------
+  aws lambda invoke \
+    --function-name gymlaunch-lead_db2-sheet-sync \
+    --invocation-type RequestResponse \
+    --cli-binary-format raw-in-base64-out \
+    --payload '{}' \
+    /tmp/out.json && cat /tmp/out.json
+
+The event payload is ignored — there are no toggles or modes. A manual invoke does
+exactly what the 07:00 cron does. The advisory lock means it's safe even if the
+cron happens to fire at the same moment; the loser just exits with "already
+running".
+
+Watch the logs live (from the console, or creds that can read CloudWatch):
+
+  aws logs tail /aws/lambda/gymlaunch-lead_db2-sheet-sync --follow --format short
+
+
+COMMON QUERIES (once the data is in RDS)
+----------------------------------------
+  -- Counts by is_system_user / asana_status combo
+  SELECT is_system_user, asana_status, COUNT(*)
+  FROM client_lead_master
+  GROUP BY 1, 2
+  ORDER BY 1, 2;
+
+  -- Clients flagged as non-system-user candidates (fb_app_status = 'Error')
+  SELECT client_name, gym_name, fb_app_status, is_system_user, asana_status
+  FROM client_lead_master
+  WHERE fb_app_status = 'Error'
+  ORDER BY client_name;
+
+Remember: it's is_system_user in SQL, NOT system_user.
+
+
+WHY THIS IS A SEPARATE LAMBDA FROM gymlaunch-supabase-lead-sync
+---------------------------------------------------------------
+  - Different source system (Google Sheets vs Supabase REST).
+  - Different failure modes (sheet rename / sharing revoked vs API auth).
+  - Runs 1 hour earlier so the supabase-lead-sync (and any phase-2 compare) sees a
+    fresh client_lead_master snapshot.
+  - Smaller blast radius: a sheet permission break doesn't kill the lead mirror,
+    and a Supabase outage doesn't block the client master refresh.
+
+
+FUTURE: THIS LAMBDA MAY EVENTUALLY GO AWAY
+------------------------------------------
+The upstream n8n "00 - Main Workflow" is the actual load-bearing FB-leads-into-GHL
+integration, not just monitoring — if it dies, customers stop getting leads in
+their CRM. The post-phase-2 plan is to replace it with our own FB-leadgen + GHL
+webhook receivers writing straight to RDS. If/when that lands, the "00 - Database"
+sheet may disappear, and this Lambda would either become obsolete or flip around
+to sync FROM RDS BACK TO a sheet (so the team keeps a familiar UI for the
+hand-edited columns). Both items are tracked in docs/future_work.md.

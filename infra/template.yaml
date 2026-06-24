@@ -73,6 +73,10 @@ Parameters:
     Type: String
     NoEcho: true
     Description: "Shared secret callers must present (x-api-key header or ?key=) to the SF subscribe Function URL."
+  FathomApiKey:
+    Type: String
+    NoEcho: true
+    Description: "Fathom API key for the nightly sync. X-Api-Key header on all Fathom API requests."
 
 Globals:
   Function:
@@ -438,6 +442,32 @@ Resources:
             Name: gymlaunch-lead_db2-sheet-sync-daily
             Enabled: true
 
+  FathomDailySyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-fathom-daily-sync
+      CodeUri: ../src/fathom/sync/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          FATHOM_API_KEY: !Ref FathomApiKey
+          # Set to "true" in Lambda console for initial full backfill, then back to "false".
+          # Full sync skips meetings already in DB with a transcript; normal run covers last 48h.
+          FULL_SYNC: "false"
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        NightlySync:
+          Type: Schedule
+          Properties:
+            # 04:00 UTC = 11pm CDT / 10pm CST — clean gap between midnight and 7am morning jobs.
+            Schedule: cron(0 4 * * ? *)
+            Name: gymlaunch-fathom-daily-sync-nightly
+            Enabled: true
+
   # SubscriptionFlow "create custom weekly sub for GO product" endpoint.
   # Invoked via a Lambda Function URL. As with gymlaunch-add-slack-channel, the
   # deploy IAM user cannot create Function URLs (lambda:CreateFunctionUrlConfig
@@ -492,6 +522,8 @@ Outputs:
     Value: !GetAtt ProjectNoteSyncFunction.Arn
   FathomWebhookFunctionArn:
     Value: !GetAtt FathomWebhookFunction.Arn
+  FathomDailySyncFunctionArn:
+    Value: !GetAtt FathomDailySyncFunction.Arn
   SupabaseLeadSyncFunctionArn:
     Value: !GetAtt SupabaseLeadSyncFunction.Arn
   LeadDb2SheetSyncFunctionArn:

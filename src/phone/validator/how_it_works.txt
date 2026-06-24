@@ -1,0 +1,230 @@
+================================================================================
+ gymlaunch-phone-validator — HOW THIS WORKS
+================================================================================
+
+==== READ THIS FIRST — THE LOGIC IS KNOWN TO BE WRONG ====
+
+This Lambda is DEPLOYED and the endpoint is LIVE, but the handler logic in this
+directory does NOT match the actual requirements. It is slated for a FULL REWRITE.
+
+  - The current code was designed as a single COMBINED phone+mobile normalizer.
+    In reality the two HubSpot fields (`phone` and `mobilephone`) serve completely
+    DIFFERENT purposes, and the agreed design splits the work into two distinct
+    MODES ("mobile" vs "phone"). The current code has no concept of modes at all.
+
+  - DO NOT wire this to HubSpot until the rewrite is done. If you point a HubSpot
+    workflow at the current handler, it will promote/normalize/cross-write the two
+    fields in ways that are not what we want (e.g. it will happily copy a mobile
+    number into the `phone` field, and it always runs Twilio Lookup regardless of
+    which field you actually care about).
+
+  - The ENDPOINT and INFRASTRUCTURE are FINE. The API Gateway route, the Lambda
+    wiring, the IAM role, the Twilio secret injection — all correct and reusable.
+    ONLY the handler logic changes in the rewrite. You do not need to touch infra.
+
+  - The agreed two-mode rewrite spec lives in:  docs/future_work.md
+    (section "Phone validator rewrite + HubSpot workflow wiring"). There is one
+    open blocking question there — what to do when mode "mobile" runs and the
+    mobile number cannot be parsed at all — so the rewrite is paused until the
+    user decides. Read that section before writing any replacement code.
+
+The rest of this document describes what the code in THIS directory CURRENTLY
+does, factually, so you understand the deployed behavior. None of it should be
+treated as the final/correct design.
+
+
+WHAT IT IS (as currently coded)
+-------------------------------
+A stateless HTTP Lambda that takes a raw `phone` value and a raw `mobilephone`
+value, normalizes BOTH using Google's libphonenumber (the `phonenumbers` package),
+decides which fields (if any) need updating and whether to promote mobile into the
+phone slot, then runs ONE Twilio Lookup v2 call on the single "winning" number.
+
+It makes NO HubSpot API calls and writes to NO database. It just returns a JSON
+blob of flags. The calling HubSpot workflow is responsible for actually writing
+fields back and creating timeline notes. The Lambda is pure compute.
+
+
+WHERE IT LIVES
+--------------
+  Lambda name:  gymlaunch-phone-validator
+  Code:         src/phone/validator/handler.py
+  Handler:      handler.lambda_handler
+  Trigger:      HTTP API (the SmsApi API Gateway), route:
+                  POST /phone/validate
+                This is the SAME API Gateway that serves the SMS interceptor and
+                the Fathom webhook — it is not a dedicated gateway.
+  Timeout:      29 seconds (the API Gateway HTTP API max integration timeout).
+  Role:         SlackSyncRole (shared; note the historical misnaming of the
+                slack-sync stack/role — see docs/system_reference.md).
+  NOT in a VPC: unlike the DB-touching Lambdas, this one has no VpcConfig because
+                it only calls out to Twilio over the public internet.
+
+  Secrets / env vars (injected by scripts/deploy.sh from Secrets Manager):
+    TWILIO_ACCOUNT_SID   from gymlaunch/twilio/account_sid
+    TWILIO_AUTH_TOKEN    from gymlaunch/twilio/auth_token
+  These are passed as plain environment variables (TwilioAccountSid /
+  TwilioAuthToken template parameters), not read from Secrets Manager at runtime.
+
+
+THE TWILIO LOOKUP CALL
+----------------------
+  Base URL:  https://lookups.twilio.com/v2/PhoneNumbers
+  Request:   GET {base}/{e164}?Fields=line_type_intelligence
+  Auth:      HTTP basic auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+  Timeout:   8 seconds per request (REQUEST_TIMEOUT)
+
+  Exactly ONE lookup is made per invocation, on whichever number won the decision
+  (winner_e164). If no number is usable, no lookup is made and lookup_error is
+  set to "no_winner". On HTTP errors or exceptions the code does NOT raise — it
+  logs and returns valid="false" with a populated lookup_error string, so the
+  workflow always gets a well-formed response.
+
+  From the Lookup response it pulls:
+    valid           -> data["valid"]                        (lowercased string)
+    line_type       -> data["line_type_intelligence"]["type"]
+    lookup_country  -> data["country_code"]
+
+
+INPUT (JSON body)
+-----------------
+  phone        raw value of the HubSpot `phone` field
+  mobilephone  raw value of the HubSpot `mobilephone` field
+
+Both are read with .get() and trimmed. A body that is not valid JSON returns
+HTTP 400 {"error":"invalid JSON"}. Anything else returns HTTP 200 with the full
+output blob below (even "nothing was usable" is a 200, not an error).
+
+
+STEP 1 — NORMALIZE EACH NUMBER (classify())
+-------------------------------------------
+Each raw string is parsed with phonenumbers.parse(raw, "US"). The "US" default
+region is what lets bare/dirty inputs resolve:
+    2135661157     -> +12135661157   (10-digit bare)
+    12135661157    -> +12135661157   (11-digit, leading 1)
+    +442071234567  -> unchanged      (already international)
+    442071234567   -> +442071234567  (international missing the +)
+
+classify() returns: valid (bool), e164 (string or ""), country (ISO alpha-2 or ""),
+and a short reason string. Parse failures are mapped to readable reasons
+("too_short_nsn", "not_a_number", "invalid_country_code", etc.) for logging and
+HubSpot branching. Blank input returns reason "blank".
+
+A field "needs update" (needs_update()) only if it parsed as VALID and its E.164
+form differs from the trimmed raw input. A number that is already perfect E.164
+is valid but does NOT get flagged for update.
+
+
+STEP 2 — DECIDE WHAT TO DO (decide())
+-------------------------------------
+This is the part that does NOT match requirements. The current priority logic:
+
+  - BOTH invalid:
+        decision_reason = noop_no_usable
+        winner_e164     = ""   (no lookup runs)
+
+  - phone INVALID, mobile VALID  -> PROMOTE mobile into phone:
+        should_update_phone = true, new_phone_value = mobile's E.164
+        winner_e164         = mobile's E.164
+        if mobile also wasn't already E.164, also flag mobile for normalization
+        decision_reason = promote_mobile_to_phone
+                          (or promote_mobile_to_phone_normalize_mobile)
+        *** This cross-write of mobile -> phone is exactly the behavior the
+            rewrite is meant to REMOVE. In the agreed design, "mobile" mode never
+            touches the phone field and "phone" mode never touches mobile. ***
+
+  - phone VALID  -> phone anchors the lookup:
+        winner_e164 = phone's E.164
+        then, depending on which fields aren't already E.164:
+          both need it      -> decision_reason = normalize_both
+          only phone        -> normalize_phone_only
+          only mobile       -> normalize_mobile_only
+          neither           -> noop
+        each flagged field gets should_update_* = true + new_*_value set.
+
+So in the current code the lookup target is "phone if phone is valid, otherwise
+the promoted mobile." There is no caller control over which field is checked —
+that single combined behavior is the core mismatch.
+
+
+STEP 3 — ROUTING FIELDS (_apply_path_fields())
+----------------------------------------------
+To save the HubSpot workflow from stacking multiple IF steps, the code precomputes
+routing tokens from the two should_update_* flags:
+    path_mobile_update  = yes / no
+    path_phone_update   = yes / no
+    singular_route      = one of:
+        singular_mobile_no_phone_no
+        singular_mobile_no_phone_yes
+        singular_mobile_yes_phone_no
+        singular_mobile_yes_phone_yes
+The intent is that a workflow branches once on singular_route to cover all four
+update combinations.
+
+NOTE: booleans are returned as the STRINGS "true"/"false" and "yes"/"no", never
+Python/JSON bools, because the HubSpot code-action environment is fussy about types.
+
+
+OUTPUT (JSON, HTTP 200)
+-----------------------
+Every key below is always present. The exact list is OUTPUT_FIELD_NAMES in the
+handler — these must be registered verbatim in the HubSpot code action's "Returns"
+section or the workflow can't read them.
+
+  Normalization:
+    phone_status      "valid" / "invalid"
+    phone_reason      classify() reason
+    phone_normalized  E.164 or ""
+    mobile_status     "valid" / "invalid"
+    mobile_reason     classify() reason
+    mobile_normalized E.164 or ""
+
+  What to write back (the workflow does the actual write):
+    should_update_phone   "true"/"false"
+    new_phone_value       E.164 or ""
+    should_update_mobile  "true"/"false"
+    new_mobile_value      E.164 or ""
+
+  Workflow routing:
+    path_mobile_update    "yes"/"no"
+    path_phone_update     "yes"/"no"
+    singular_route        token (see above)
+    decision_reason       token (see above)
+    winner_e164           the single number Twilio Lookup ran on, or ""
+
+  Twilio Lookup result:
+    valid           "true"/"false"/"" (string)
+    line_type       e.g. "mobile", "landline", "voip", or ""
+    lookup_country  ISO country code or ""
+    lookup_error    "" on success; "no_winner", "HTTP 4xx: ...", or an exception
+                    string on failure
+
+
+HOW TO RUN IT BY HAND
+---------------------
+It is an HTTP endpoint, so curl it (POST /phone/validate on the SmsApi gateway):
+
+  curl -s -X POST \
+    https://<smsapi-host>/phone/validate \
+    -H 'Content-Type: application/json' \
+    -d '{"phone":"2135661157","mobilephone":"+447700900000"}'
+
+You can also invoke the Lambda directly with an API-Gateway-shaped event whose
+"body" is the JSON string above. A 200 with decision_reason=noop_no_usable and
+lookup_error=no_winner is a normal "nothing was parseable" result, not a crash.
+
+(See docs/system_reference.md for the live SmsApi host id.)
+
+
+WHY IT IS NOT DONE (the rewrite, in one paragraph)
+--------------------------------------------------
+The agreed replacement adds a `mode` input and splits behavior:
+  - mode "mobile" (SMS, primary): normalize + Lookup the MOBILE only, apply a
+    country allowlist and suppress landline/voip line types, never touch phone,
+    and return a pre-formatted note_body.
+  - mode "phone" (power dialer, secondary): normalize the PHONE only, NO Twilio
+    Lookup, and only suggest a phone value from mobile if phone is invalid.
+The current single-blob logic does none of this mode separation. Full spec,
+the country allowlist, the line-type rules, the two HubSpot workflows to build,
+and the one open blocking question are all in docs/future_work.md under
+"Phone validator rewrite + HubSpot workflow wiring". Do that first.

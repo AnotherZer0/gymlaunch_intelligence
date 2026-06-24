@@ -1,0 +1,141 @@
+================================================================================
+ gymlaunch-asana-agency-board-deep-sync — HOW THIS WORKS
+================================================================================
+
+WHAT IT IS
+----------
+A scheduled Lambda that runs once daily and "deep syncs" the Agency Board: for
+every top-level task already in the database, it pulls that task's SUBTASKS and
+its COMMENTS from the Asana API and upserts them.
+
+It is the companion to the hourly sync (gymlaunch-asana-agency-board-sync,
+src/sync/asana/agency_board/). That hourly job keeps the top-level tasks and the
+denormalized board rows (asana_agency_board_task) fresh. The deep sync does NOT
+re-discover top-level tasks — it relies on the hourly sync having already put
+them in asana_task. It only goes one level deeper: subtasks and comments, which
+are too expensive to fetch every hour because they cost an extra API call per
+task.
+
+
+WHERE IT LIVES
+--------------
+  Lambda name:  gymlaunch-asana-agency-board-deep-sync
+  Code:         src/sync/asana/deep/handler.py
+  Schedule:     rate(1 day)  — runs once every 24h (rule
+                gymlaunch-asana-agency-board-deep-sync-daily).
+                Meant to run after the hourly sync, which keeps top-level tasks
+                current; the deep sync just walks whatever is already there.
+  Secret:       gymlaunch/asana/token  (JSON key: token)
+                Injected as the ASANA_TOKEN env var.
+
+  Env vars (infra/template.yaml, AsanaDeepSyncFunction):
+    ASANA_TOKEN ......... the Asana personal access token (from the secret above)
+    ASANA_PROJECT_GID ... "1206006426591402"  (the Agency Board project GID)
+  The DB connection vars (DB_HOST, DB_NAME, DB_USER, DB_PASSWORD) are NOT in the
+  template — like the other syncs, they are injected by scripts/deploy.sh at
+  deploy time. The function runs inside the VPC (DbSecurityGroupId + SubnetIds)
+  so it can reach the Postgres instance, and connects over SSL via pg8000.
+
+
+WHAT A RUN DOES (step by step)
+------------------------------
+  1. Open an Asana API client and a Postgres connection.
+
+  2. Take a PostgreSQL ADVISORY LOCK to guarantee only one deep sync runs at a
+     time:
+         pg_try_advisory_lock(hashtext(ASANA_PROJECT_GID + "_deep"))
+     If the lock is already held (a previous run is still going), the function
+     logs "Another deep sync is already running" and exits cleanly with a 200.
+     This is the same concurrency-guard pattern the hourly sync uses; note the
+     "_deep" suffix gives it a SEPARATE lock key, so the hourly and deep syncs
+     never block each other.
+
+  3. Load the work list — every top-level task on the Agency Board:
+         SELECT gid FROM asana_task
+         WHERE parent_task_gid IS NULL AND project_gid = ASANA_PROJECT_GID
+     These gids come straight from the DB (populated by the hourly sync), not
+     from a fresh Asana fetch.
+
+  4. For each task gid, in order:
+       a. sync_subtasks() — GET subtasks for the task. For every subtask:
+            - upsert it into asana_task (with parent_task_gid set to the parent),
+            - extract its custom fields and upsert a row into
+              asana_agency_board_task via build_board_row() / upsert_board_row(),
+              exactly like the hourly sync does for top-level tasks.
+       b. sync_comments() — GET the task's stories, keep only the ones whose
+          type == "comment", and upsert each into asana_task_comment.
+       c. conn.commit() — committed PER TASK, so a failure partway through never
+          throws away the tasks already processed (same safety property as the
+          hourly sync).
+     Progress is logged every 100 tasks.
+
+  5. Print a summary and return:  {"statusCode": 200, "body": "Deep sync complete"}.
+
+
+WHAT IT WRITES (the tables and upsert keys)
+-------------------------------------------
+  asana_task              — subtasks, ON CONFLICT (gid) DO UPDATE. Stores the
+                            full Asana payload in raw_payload. Parent linkage is
+                            via parent_task_gid.
+  asana_user              — any assignee or comment author seen, upserted first
+                            (ON CONFLICT (gid)) so foreign-key references resolve.
+  asana_agency_board_task — denormalized custom-field row per subtask,
+                            ON CONFLICT (task_gid). content_hash is computed over
+                            the HASH_FIELDS so a downstream HubSpot re-sync only
+                            fires when a watched field actually changes — the
+                            same mechanism documented in the agency_board sync's
+                            how_to_update.txt.
+  asana_task_comment      — one row per comment, ON CONFLICT (gid) DO UPDATE SET
+                            text. Comments with no parseable created_at are
+                            skipped.
+
+Because everything upserts on a stable key, the deep sync is fully idempotent —
+re-running it never duplicates rows and never clobbers data with stale values.
+
+
+CUSTOM FIELDS
+-------------
+The deep sync shares the same custom-field machinery as the hourly agency_board
+sync: the CF dict, HASH_FIELDS, build_board_row(), upsert_board_row(), and the
+content-hash logic are mirrored here. If you add a new custom field, follow
+src/sync/asana/agency_board/how_to_update.txt — and keep this handler's copy of
+those structures in step with the agency_board handler so subtasks pick up the
+new field too.
+
+
+ERROR HANDLING
+--------------
+Per-task fetches are defensive: if get_subtasks_for_task or get_stories_for_task
+throws for one task, the error is printed ("Could not fetch ... for <gid>") and
+that task is skipped rather than killing the whole run. Any other unexpected
+error is logged and re-raised so the invocation fails loudly. The DB connection
+is always closed in a finally block.
+
+
+HOW TO RUN IT BY HAND
+---------------------
+  aws lambda invoke \
+    --function-name gymlaunch-asana-agency-board-deep-sync \
+    --invocation-type RequestResponse \
+    --cli-binary-format raw-in-base64-out \
+    --payload '{}' \
+    /tmp/out.json && cat /tmp/out.json
+
+A healthy result is {"statusCode":200,"body":"Deep sync complete"}. If you get
+back "Skipped: deep sync already running", another invocation is mid-run — wait
+for it to finish and try again.
+
+The payload is ignored; there are no run-time knobs. The only inputs are the two
+env vars and whatever top-level tasks the hourly sync has already loaded.
+
+
+HOW IT RELATES TO THE HOURLY SYNC
+---------------------------------
+  src/sync/asana/agency_board/  -> gymlaunch-asana-agency-board-sync   (hourly)
+                                     top-level tasks + board rows
+  src/sync/asana/deep/          -> gymlaunch-asana-agency-board-deep-sync (daily)
+                                     subtasks + comments for those tasks
+
+Same project GID (1206006426591402), same tables, same upsert keys, separate
+advisory-lock keys. The hourly job is the source of the top-level task list; the
+deep job fills in everything beneath it.

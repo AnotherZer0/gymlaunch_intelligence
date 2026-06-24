@@ -51,6 +51,11 @@ FATHOM_WEBHOOK_SECRET=$(aws secretsmanager get-secret-value \
   --query SecretString --output text \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['secret'])")
 
+FATHOM_API_KEY=$(aws secretsmanager get-secret-value \
+  --secret-id gymlaunch/fathom/Fathom-API-Key \
+  --query SecretString --output text \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['api_key'])")
+
 # JSON object: {"acct_1xxx": "sk_live_xxx", ...} — base64 encoded to survive param quoting
 STRIPE_API_KEYS_B64=$(aws secretsmanager get-secret-value \
   --secret-id gymlaunch/stripe/api_keys \
@@ -120,7 +125,8 @@ sam deploy \
     "LeadDb2SheetId=${LEAD_DB2_SHEET_ID}" \
     "SfClientId=${SF_CLIENT_ID}" \
     "SfClientSecret=${SF_CLIENT_SECRET}" \
-    "SfEndpointApiKey=${SF_ENDPOINT_API_KEY}"
+    "SfEndpointApiKey=${SF_ENDPOINT_API_KEY}" \
+    "FathomApiKey=${FATHOM_API_KEY}"
 
 echo "Setting log retention..."
 set_retention() {
@@ -141,6 +147,7 @@ set_retention /aws/lambda/gymlaunch-project-note-sync
 set_retention /aws/lambda/gymlaunch-supabase-lead-sync
 set_retention /aws/lambda/gymlaunch-lead_db2-sheet-sync
 set_retention /aws/lambda/gymlaunch-sf-create-custom-weekly-sub-for-go-product
+set_retention /aws/lambda/gymlaunch-fathom-daily-sync
 # gymlaunch-add-slack-channel is managed manually (not in the SAM stack — see template.yaml),
 # but we still set log retention on it here for hygiene.
 set_retention /aws/lambda/gymlaunch-add-slack-channel

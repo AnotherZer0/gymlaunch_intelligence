@@ -1,0 +1,190 @@
+================================================================================
+ gymlaunch-fathom-daily-sync — HOW THIS WORKS
+================================================================================
+
+WHAT IT IS
+----------
+A scheduled Lambda that pulls meetings from the Fathom API every night and writes
+them into the same two tables the webhook uses (fathom_call + fathom_call_invitee).
+
+This is now the PRIMARY way call data gets into the database. The old webhook
+(gymlaunch-fathom-webhook, fired by Zapier) is kept alive as a cheap backup, but
+the nightly API sync is the authoritative path. We moved to a sync because the
+webhook depended on Zapier staying perfectly configured forever — if a zap failed
+or Zapier had downtime, those calls were lost silently. A nightly pull against the
+source of truth (Fathom's own API) closes that gap.
+
+Both paths upsert on fathom_id, so it is completely safe for them to both run and
+write the same call. Whoever writes last wins, and the data is identical.
+
+
+WHERE IT LIVES
+--------------
+  Lambda name:  gymlaunch-fathom-daily-sync
+  Code:         src/fathom/sync/handler.py
+  Schedule:     cron(0 4 * * ? *)  — 04:00 UTC daily (11pm CDT / 10pm CST)
+                Chosen because it sits in a quiet gap: after the midnight
+                mb-capacity job and well before the 07:00/08:00 morning cluster.
+  Secret:       gymlaunch/fathom/Fathom-API-Key  (JSON key: api_key)
+                Injected by scripts/deploy.sh as the FATHOM_API_KEY env var.
+
+
+THE FATHOM API
+--------------
+  Base URL:     https://api.fathom.ai/external/v1
+                (NOTE: it is api.fathom.ai, NOT api.fathom.video — the .video host
+                 does not resolve. The docs live at developers.fathom.ai.)
+  Auth:         X-Api-Key header (the raw key, no "Bearer" prefix)
+  Rate limit:   60 requests / minute across all of an account's keys
+
+  Endpoint used:   GET /meetings?include_transcript=true
+    - include_transcript=true returns the full transcript INLINE on each meeting,
+      so we never make a separate per-call transcript request. One request per
+      page of results, nothing more. This keeps us far under the rate limit.
+    - created_after=<ISO8601>  filters to recently-created meetings (normal run).
+
+  Response shape:
+    {
+      "limit": 50,
+      "next_cursor": "abc123",        <- null when there are no more pages
+      "items": [ <Meeting>, <Meeting>, ... ]
+    }
+
+  Pagination is CURSOR-based (not page numbers):
+    - Read next_cursor from the response.
+    - If it is non-null, pass it back as ?cursor=<value> to get the next page.
+    - Stop when next_cursor is null/absent.
+
+  A Meeting object carries (the fields we map):
+    recording_id ............ our fathom_id (the unique key)
+    title / meeting_title ... meeting name
+    recorded_by ............. { name, email, team }  -> the Fathom user (host)
+    scheduled_start_time .... ISO 8601
+    scheduled_end_time ...... ISO 8601
+    recording_start_time .... ISO 8601
+    recording_end_time ...... ISO 8601
+    url / share_url / meeting_url ... links
+    calendar_invitees[] ..... { name, email, email_domain, is_external }
+    transcript[] ............ [ { speaker:{display_name}, text, timestamp }, ... ]
+
+
+WHAT A RUN DOES (step by step)
+------------------------------
+  1. Read FULL_SYNC env var (default "false").
+
+  2. Build the query:
+       - Normal run:  created_after = now minus 48 hours.
+                      Why 48h and not 24h? Overlap. If one nightly run is skipped
+                      or fails, the next run's 48h window still re-covers the gap.
+                      Upsert makes the re-coverage harmless.
+       - Full sync:   no date filter — ask for everything.
+
+  3. Page through /meetings with the cursor until next_cursor is null.
+
+  4. For each page:
+       a. Collect the recording_ids on the page.
+       b. ONE batch DB query asks: which of these do we ALREADY have stored WITH a
+          transcript? (get_ids_with_transcript)
+       c. Any meeting already stored-with-transcript is SKIPPED (skipped++). This is
+          the "intelligent" part of full sync — we don't re-download transcripts we
+          already hold. On a backfill of 500 calls where 480 are already in the DB,
+          only the 20 new ones do any write work.
+       d. For each meeting we DO need: flatten transcript[] into one plaintext blob
+          ("Speaker: text" per line), then upsert into fathom_call, then upsert each
+          calendar invitee into fathom_call_invitee. Commit per-meeting so one bad
+          row never loses the whole run.
+
+  5. Print a summary and return it:  { stored, skipped, errors }
+
+
+THE UPSERT (why nothing gets duplicated or clobbered)
+-----------------------------------------------------
+fathom_call has a UNIQUE constraint on fathom_id. The INSERT ... ON CONFLICT
+(fathom_id) DO UPDATE re-writes the row's fields if the call already exists.
+
+One deliberate subtlety on the transcript column:
+    transcript_plaintext = COALESCE(EXCLUDED.transcript_plaintext,
+                                    fathom_call.transcript_plaintext)
+This means: only overwrite the stored transcript if the new payload actually HAS
+one. If a later sync returns a meeting without a transcript (still processing,
+permissions, etc.), we keep the transcript we already had instead of nulling it.
+
+Invitees upsert on (call_id, email), so re-running never creates duplicate invitee
+rows for the same person on the same call.
+
+
+RATE-LIMIT HANDLING (the 429 story)
+-----------------------------------
+Fathom caps at 60 requests/minute. Two safeguards, both in handler.py:
+
+  1. THROTTLE_SECONDS (1.1s) sleep between page fetches. 1 request/sec keeps us
+     under 60/min by construction, even on a long full-sync backfill.
+
+  2. fathom_get() retries on HTTP 429 (and transient 5xx: 500/502/503/504), up to
+     MAX_RETRIES (5) times. It honors Fathom's Retry-After header if present,
+     otherwise backs off exponentially (1, 2, 4, 8... capped at 30s). So a transient
+     throttle self-heals instead of crashing the run.
+
+If you ever see the run die on a 429 anyway, it means Fathom stayed throttled past
+5 retries — just wait a full minute and re-invoke. (This usually only happens if
+something else is hammering the same API key at the same time.)
+
+
+HOW TO RUN IT BY HAND
+---------------------
+Normal 48h window (what the schedule does):
+
+  aws lambda invoke \
+    --function-name gymlaunch-fathom-daily-sync \
+    --invocation-type RequestResponse \
+    --cli-binary-format raw-in-base64-out \
+    --payload '{}' \
+    /tmp/out.json && cat /tmp/out.json
+
+The result lands in /tmp/out.json, e.g. {"statusCode":200,"stored":3,"skipped":0,
+"errors":0}. stored=0 with errors=0 is a HEALTHY result on a quiet day — it means
+the API connection worked and there was simply nothing new in the window.
+
+Watch the logs live (from the console, or creds that can read CloudWatch):
+
+  aws logs tail /aws/lambda/gymlaunch-fathom-daily-sync --follow --format short
+
+(NOTE: the gymlaunch-deploy IAM user CANNOT read CloudWatch logs. With those creds
+ the invoke output file is your visibility; read logs from the browser console.)
+
+
+FIRST-TIME / FULL BACKFILL
+--------------------------
+FULL_SYNC is controlled by an ENVIRONMENT VARIABLE, not the invoke payload.
+
+  1. In the Lambda console, set env var FULL_SYNC = true.
+  2. Invoke once (same command as above). It will page through ALL meetings and
+     store every one not already held with a transcript. This can take a while and
+     will make many paged requests — the throttle keeps it under the rate limit.
+  3. Set FULL_SYNC back to false (it resets to "false" on the next deploy anyway,
+     since the template default is "false", but set it explicitly to be safe).
+
+After the backfill, the nightly 48h window keeps everything current.
+
+
+HOW IT RELATES TO THE WEBHOOK
+-----------------------------
+  src/fathom/webhook/   -> gymlaunch-fathom-webhook  (Zapier -> HTTP, BACKUP)
+  src/fathom/sync/      -> gymlaunch-fathom-daily-sync (API pull, PRIMARY)
+
+Same two tables, same upsert key (fathom_id), so they never conflict. If you ever
+want to fully retire the webhook, you can — the sync alone keeps the data complete
+(with up to ~24h latency vs the webhook's near-real-time). For now the webhook is
+kept as a no-cost belt-and-suspenders.
+
+
+WHAT WE DELIBERATELY DID NOT BUILD
+----------------------------------
+No summary pipeline. The fathom_call.summary column exists but stays NULL. We
+decided not to pre-generate per-call summaries because the AI brain can read full
+transcripts directly (a typical call is a few thousand tokens; 15-20 fit easily in
+Claude's context window). See docs/future_work.md for the abandoned-design note.
+
+To query call data for the AI brain, see src/fathom/webhook/how_to_query.txt — the
+table layout and join-by-invitee-email pattern are identical regardless of which
+path wrote the row.

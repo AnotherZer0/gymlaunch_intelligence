@@ -1,0 +1,296 @@
+================================================================================
+ gymlaunch-slack-sync — HOW THIS WORKS
+================================================================================
+
+WHAT IT IS
+----------
+A scheduled Lambda that runs once an hour, walks every Slack channel the team
+has registered for syncing, and pulls those channels' message history into RDS.
+It writes three tables: slack_message (the messages), slack_user (the people who
+posted them), and slack_sync_state (a per-channel bookmark of where it left off).
+
+This is the ORIGINAL Lambda in this project — the very first thing deployed. The
+whole CloudFormation stack and the shared IAM role are both named
+"gymlaunch-slack-sync" after it, even though they now hold ~15 other functions
+too. The name is misleading but renaming it would mean tearing down and
+recreating every resource, so it stays. (See docs/system_reference.md.)
+
+It does NOT discover channels on its own and it does NOT join channels. It only
+reads channels that are already marked active = true in the slack_channel table.
+A SEPARATE Lambda, gymlaunch-add-slack-channel, is what puts rows into that
+table — see "HOW IT RELATES TO add-slack-channel" near the bottom.
+
+
+WHERE IT LIVES
+--------------
+  Lambda name:  gymlaunch-slack-sync
+  Code:         src/sync/slack/handler.py
+  Schedule:     rate(1 hour)  — EventBridge rule gymlaunch-slack-sync-hourly.
+                Fires every 60 minutes from the last deploy/fire (drifts off
+                clock time; that's fine, it's a background sync).
+  Secret:       gymlaunch/slack/bot_token  (JSON key: bot_token)
+                Injected by scripts/deploy.sh as the SLACK_BOT_TOKEN env var.
+  Template:     infra/template.yaml — resources SlackSyncFunction (the function)
+                and SlackSyncRole (the shared role, RoleName gymlaunch-slack-sync).
+  VPC:          Runs in the VPC (same subnets + DB security group as the other
+                Lambdas) so it can reach RDS.
+
+  Environment variables it reads:
+    SLACK_BOT_TOKEN .. the bot token, set on THIS function from the secret above.
+    DB_HOST          .. these four come from the template's Globals block, so
+    DB_NAME             every Lambda in the stack gets them automatically. They
+    DB_USER             point at the gymlaunch_intelligence RDS database and the
+    DB_PASSWORD         gls_writer user. handler.py connects over SSL with pg8000.
+
+
+THE SLACK API
+-------------
+  Auth:         A bot token (xoxb-...) passed to the slack_sdk WebClient. The bot
+                must already be a member of every channel it syncs — Slack's
+                conversations.history only returns messages for channels the bot
+                is in. (Joining channels is add-slack-channel's job, not this
+                Lambda's.)
+
+  Endpoints used (all via slack_sdk.WebClient):
+    conversations_history .. pulls a page of top-level messages for one channel.
+    conversations_replies .. pulls all replies in one thread (given the parent ts).
+    users_info ............. looks up one user's profile (name, email, is_bot).
+
+  Pagination is CURSOR-based:
+    - Each conversations_history response carries response_metadata.next_cursor.
+    - If it is non-empty, pass it back as cursor=<value> for the next page.
+    - Stop when next_cursor is empty/absent.
+    - Page size is limit=200.
+
+  A Slack message object carries (the fields we use):
+    ts ............ the message timestamp string, e.g. "1716220000.123456".
+                    This is Slack's unique-within-channel message id AND its
+                    sort key. We store it verbatim and also convert it to a real
+                    UTC timestamp (posted_at) for querying.
+    thread_ts ..... the parent message's ts if this message is in a thread.
+                    If thread_ts exists and differs from ts, it's a reply.
+                    If thread_ts == ts, this message IS a thread parent.
+    user .......... the poster's Slack user id (e.g. "U0123...").
+    text .......... the message body.
+    subtype ....... present on system messages (joins, topic changes, etc.).
+    bot_id ........ present on messages posted by bots/apps.
+    reply_count ... how many replies a thread parent has.
+
+
+WHAT A RUN DOES (step by step)
+------------------------------
+  1. Open a Slack client (from SLACK_BOT_TOKEN) and a DB connection.
+
+  2. Load the work list:
+       SELECT channel_id, name FROM slack_channel WHERE active = true
+     That's the entire scope of the run. No active channels => nothing happens.
+
+  3. For EACH active channel, call sync_channel(...) and then COMMIT. The commit
+     is per-channel on purpose: if channel #7 blows up, channels #1-#6 are
+     already safely saved.
+
+  4. If a channel raises, the error is caught, the transaction is ROLLED BACK,
+     and a separate cursor writes status='error' + the error message into
+     slack_sync_state for that channel (then commits that). One bad channel never
+     aborts the rest of the run.
+
+  5. Return {"statusCode": 200, "body": "Sync complete"} and close the DB
+     connection in a finally block.
+
+  WHAT sync_channel DOES FOR ONE CHANNEL:
+
+  a. Read the bookmark: SELECT last_ts FROM slack_sync_state WHERE channel_id=...
+     This is the ts of the newest message we stored last time. It becomes the
+     "oldest" parameter on the history call, so Slack only returns messages NEWER
+     than what we already have. First-ever run has no bookmark => oldest is unset
+     => Slack returns the channel's full history (paged).
+
+  b. Page through conversations_history (cursor loop, limit 200). For each
+     message in each page:
+       - SKIP it if it has a subtype OR a bot_id (system messages and bot posts
+         are intentionally not stored).
+       - If the poster's user id is one we haven't seen THIS run, call users_info
+         and upsert them into slack_user. A per-run in-memory set (known_users)
+         means we look up each user at most once per invocation.
+       - Upsert the message into slack_message.
+       - Track the highest ts seen so far (this becomes the new bookmark).
+       - If the message is a thread parent WITH replies (reply_count > 0 and
+         thread_ts == ts), call sync_thread to pull its replies right away.
+
+  c. AFTER the incremental page loop, re-check recent threads. This is the
+     subtle part. Slack does NOT resurface an old parent message in
+     conversations_history just because someone added a reply to it — so the
+     incremental fetch above would miss late replies on older threads. To close
+     that gap, sync_channel queries OUR OWN slack_message table for every thread
+     parent in this channel from the last 7 days:
+
+       SELECT DISTINCT ts FROM slack_message
+       WHERE channel_id = ... AND is_thread_reply = false
+         AND thread_ts IS NOT NULL AND posted_at > now() - interval '7 days'
+
+     and calls sync_thread on each one to re-pull its replies. So any reply added
+     to a thread whose parent is < 7 days old gets caught on the next hourly run.
+     (Replies to threads older than 7 days are the accepted blind spot.)
+
+  d. Write the bookmark: upsert slack_sync_state with the new last_ts and
+     status='ok'.
+
+  WHAT sync_thread DOES:
+     Calls conversations_replies for one thread (limit 200), skips index 0 (that's
+     the parent, already stored), and upserts each reply — fetching+upserting the
+     replier into slack_user first if they're new this run, same as above.
+
+
+THE TABLES
+----------
+  slack_channel       -- THE INPUT. One row per channel to sync. This Lambda only
+                         READS it (WHERE active = true). Rows are written by the
+                         separate gymlaunch-add-slack-channel Lambda. Columns used
+                         here: channel_id, name, active.
+
+  slack_message       -- One row per stored message (top-level OR thread reply).
+                         Written by upsert_message. Columns:
+                           channel_id, user_id, ts, thread_ts,
+                           is_thread_reply (bool: true when thread_ts exists and
+                             differs from ts),
+                           text, posted_at (ts converted to a real UTC timestamp),
+                           raw_payload (the full Slack message JSON, kept verbatim).
+
+  slack_user          -- One row per Slack user we've encountered. Written by
+                         upsert_user. Columns:
+                           user_id, name, display_name, email,
+                           is_internal, is_bot, updated_at.
+
+  slack_sync_state    -- One row per channel: the bookmark + health.
+                           channel_id, last_ts (newest message ts we've stored),
+                           last_synced_at, status ('ok' / 'error'),
+                           error_message, updated_at.
+
+  (Schema lives in db/migrations/002_slack_schema.sql.)
+
+
+THE UPSERTS (why re-running never duplicates or clobbers)
+---------------------------------------------------------
+Everything is INSERT ... ON CONFLICT DO UPDATE, so the same hourly job can run
+forever and safely re-touch rows.
+
+  MESSAGES — conflict key is (channel_id, ts). On conflict it updates ONLY text
+  and raw_payload. It deliberately does NOT touch posted_at, so the original
+  ingestion-derived timestamp is preserved even if a message is edited and
+  re-seen later. (ts itself never changes — it's Slack's immutable id.)
+
+  USERS — conflict key is user_id. On conflict it refreshes name, display_name,
+  email, is_bot, updated_at. The is_internal flag has special handling:
+
+      is_internal = CASE
+          WHEN slack_user.classification_locked THEN slack_user.is_internal
+          ELSE EXCLUDED.is_internal
+      END
+
+  Normally is_internal is computed from the email domain (see below). But if a
+  human has set classification_locked on that user, the lock wins and the
+  computed value is ignored — a manual override the sync will never stomp.
+
+  SYNC STATE — conflict key is channel_id. Always overwrites last_ts,
+  last_synced_at, status, error_message.
+
+
+INTERNAL-vs-EXTERNAL USER CLASSIFICATION
+----------------------------------------
+is_internal_email() marks a user "internal" if their Slack profile email ends in
+one of: gymlaunch.com, gymlaunchsecrets.com, gymowners.com. No email => not
+internal. This is what feeds slack_user.is_internal on every upsert — except when
+classification_locked is set, in which case the stored value is kept (see above).
+The point is to separate staff from clients in the data lake for later analysis.
+
+
+WHAT GETS SKIPPED (on purpose)
+------------------------------
+  - System messages (anything with a subtype: joins, topic changes, pins...).
+  - Bot/app messages (anything with a bot_id).
+  - Replies on threads whose parent is older than 7 days (the late-reply
+    re-check window is 7 days; older threads aren't revisited).
+  - Channels not marked active = true in slack_channel.
+
+
+HOW IT RELATES TO add-slack-channel
+-----------------------------------
+  src/slack/add_channel/  -> gymlaunch-add-slack-channel  (WRITES slack_channel)
+  src/sync/slack/         -> gymlaunch-slack-sync         (READS slack_channel)
+
+These two are a producer/consumer pair around the slack_channel table:
+
+  - gymlaunch-add-slack-channel is a small on-demand Function URL endpoint
+    (typically called from a HubSpot workflow). You hand it a Slack channel id;
+    it verifies the bot can actually read that channel, then inserts/activates a
+    row in slack_channel (active = true). It is add-only and is managed manually
+    (NOT in the SAM stack), because the deploy IAM user can't create Function
+    URLs. Full details in src/slack/add_channel/README.txt.
+
+  - gymlaunch-slack-sync (this Lambda) then picks that channel up on its next
+    hourly run, because its work list is exactly "SELECT ... WHERE active = true".
+
+So the flow is: add-slack-channel registers a channel -> within the hour,
+slack-sync starts ingesting its history into slack_message. To STOP syncing a
+channel, set active = false on its slack_channel row (add-slack-channel has no
+deactivate path — use scripts/manage_channels.py or the DB directly).
+
+
+HOW TO RUN IT BY HAND
+---------------------
+The schedule fires it hourly, but you can force a run:
+
+  aws lambda invoke \
+    --function-name gymlaunch-slack-sync \
+    --invocation-type RequestResponse \
+    --cli-binary-format raw-in-base64-out \
+    --payload '{}' \
+    /tmp/out.json && cat /tmp/out.json
+
+The event payload is ignored — there are no input parameters. A healthy result
+is {"statusCode": 200, "body": "Sync complete"}.
+
+Watch the logs live (from the console, or creds that can read CloudWatch):
+
+  aws logs tail /aws/lambda/gymlaunch-slack-sync --follow --format short
+
+(NOTE: the gymlaunch-deploy IAM user CANNOT read CloudWatch logs. With those
+ creds the invoke output file is your only visibility; read logs from the
+ browser console.)
+
+
+FIRST-TIME BEHAVIOR / BACKFILL
+------------------------------
+There is no FULL_SYNC switch. Backfill is automatic and per-channel: a channel
+with no row in slack_sync_state has no bookmark, so its first sync pulls the
+channel's ENTIRE accessible history (paged 200 at a time). That happens the first
+hour after a channel is added via add-slack-channel. Every run after that is
+incremental (only messages newer than last_ts) plus the 7-day thread re-check.
+
+To force a full re-pull of one channel, delete its bookmark and re-invoke:
+
+  DELETE FROM slack_sync_state WHERE channel_id = 'C0123456789';
+
+The next run sees no last_ts and re-pages the whole history. Because messages
+upsert on (channel_id, ts), re-pulling never creates duplicates.
+
+
+CHECKING HEALTH (SQL)
+---------------------
+  -- Per-channel sync status and how far behind each is
+  SELECT c.name, s.status, s.last_synced_at, s.error_message
+  FROM slack_channel c
+  LEFT JOIN slack_sync_state s ON s.channel_id = c.channel_id
+  WHERE c.active = true
+  ORDER BY s.last_synced_at NULLS FIRST;
+
+  -- Channels currently in an error state
+  SELECT channel_id, error_message, updated_at
+  FROM slack_sync_state
+  WHERE status = 'error';
+
+  -- Message volume per channel
+  SELECT channel_id, count(*), max(posted_at) AS latest
+  FROM slack_message
+  GROUP BY channel_id
+  ORDER BY latest DESC NULLS LAST;

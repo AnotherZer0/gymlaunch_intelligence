@@ -1,0 +1,100 @@
+================================================================================
+ gymlaunch-stripe-finance-report — HOW THIS WORKS
+================================================================================
+
+WHAT IT IS
+----------
+A scheduled Lambda that runs Monday through Friday and emails an accounting-ready
+finance report. Each run pulls the most recent UNPROCESSED paid payout from each of
+our 3 Stripe accounts, turns that payout's balance transactions into a CSV (one CSV
+per account), and sends all of them as attachments in a single SES email.
+
+The whole point is to hand finance a daily, GL-coded breakdown of what actually hit
+the bank — one CSV per account, every row tagged with a GL code and an Intacct SKU —
+without anyone logging into Stripe and exporting by hand. It replaces 3 old Zapier
+"steps" (one per account) whose categorization logic now lives in handler.py.
+
+
+WHERE IT LIVES
+--------------
+  Lambda name:  gymlaunch-stripe-finance-report
+  Code:         src/sync/stripe/finance_report/handler.py
+  Schedule:     cron(0 15 ? * MON-FRI *)  — 15:00 UTC, weekdays only.
+                That is 10am CDT in summer. It DRIFTS to 9am in winter (CST),
+                because the cron is fixed in UTC and does not observe DST. If you
+                want 10am year-round, change the 15 to 16 (see system_reference.md).
+  Secret:       gymlaunch/stripe/api_keys  — a JSON object keyed by Stripe account ID,
+                value = that account's restricted API key. Injected by
+                scripts/deploy.sh as the base64 env var STRIPE_API_KEYS_B64.
+  Delivery:     SES email. SES_FROM_ADDRESS -> SES_TO_ADDRESS (both env vars).
+
+  The 3 accounts (keys in the secret are looked up by these exact IDs):
+    acct_1EJ3grGXzfVc86k5 ... Gymlaunch
+    acct_1HTxq8DwroTQxWiD ... Gymlaunch Kajabi          (Kajabi)
+    acct_1NdhHHFIzHSkCkYd ... Gym Launch Go High Level  (GHL)
+
+
+WHAT A RUN DOES (step by step)
+------------------------------
+  1. Decode the API keys from STRIPE_API_KEYS_B64 and open the RDS connection.
+
+  2. Read every payout_id already in the stripe_payout_export table. This is the
+     dedup set — anything in here has already been emailed and must not be re-sent.
+
+  3. For EACH of the 3 accounts:
+       a. Ask Stripe for the single latest payout with status='paid'.
+       b. If that payout's id is already in the dedup set, SKIP the account (it
+          gets listed as "no new payout, skipped" in the email body).
+       c. Otherwise, list all balance transactions belonging to that payout
+          (auto-paging, with source/charge/customer expanded so we can read
+          descriptions, amounts, and customer info), and build one CSV row each.
+       d. The payout transfer row itself is dropped — it's the bank movement, not
+          a transaction. Every other row is categorized into a GL code + SKU.
+
+  4. If NO account had a new payout, exit without sending (returns "no new payouts").
+
+  5. Otherwise build ONE SES email: a short plaintext body listing which accounts
+     are attached (with payout date) and which were skipped, plus one CSV attachment
+     per account. Filenames use the payout's arrival_date, e.g.
+     stripe_gymlaunch_2026-05-19.csv.
+
+  6. ONLY AFTER the email send succeeds, write each processed payout_id into
+     stripe_payout_export. Doing it in this order means a delivery failure leaves
+     the payout un-marked, so simply re-invoking the Lambda safely retries it.
+
+
+CATEGORIZATION — GL CODE + INTACCT SKU
+--------------------------------------
+Every CSV row gets a GL Code and (where applicable) an Intacct SKU. The rules are
+account-specific for charges (matched on description text + dollar amount) and
+global for the other row types:
+
+  - charges      -> per-account match table (auto_recharge, gl_book, trainerize_*, etc.)
+  - refunds      -> GL 48100, SKU inherited from the original charge
+  - chargebacks  -> GL 48000, SKU inherited from the original charge
+  - Stripe fees  -> GL 50080, no SKU
+  - anything unmatched is logged to CloudWatch as "UNMATCHED ..." and left blank
+
+>>> The FULL, authoritative mapping table (every match condition, GL code, and SKU
+    per account) lives in docs/system_reference.md under "Stripe Finance Report".
+    Treat that doc as the source of truth — do not re-derive the table from here.
+    The LOOKUP_TABLE / categorize() logic in handler.py mirrors it exactly.
+
+
+WHY deliver_report() IS ITS OWN FUNCTION
+----------------------------------------
+All the SES/email-building logic is isolated in deliver_report() on purpose. The
+rest of the handler only knows "here are the CSVs by account" — it does not care HOW
+they leave the building. If we ever want to swap SES for S3 upload, a Slack post, or
+a different mailer, that's a one-function change with no impact on the Stripe pull or
+the categorization logic.
+
+
+OPERATOR NOTES (re-runs, IAM, SES, DST)
+---------------------------------------
+For the operational details, see docs/system_reference.md -> "Stripe Finance Report":
+  - How to re-run a specific account (DELETE its rows from stripe_payout_export).
+  - The exact Stripe restricted-key permissions each API key needs.
+  - The ses:SendRawEmail IAM policy + permissions-boundary requirement, and the
+    SES domain verification / sandbox requirement.
+  - The DST note on the schedule (15:00 UTC = 10am CDT / 9am CST).

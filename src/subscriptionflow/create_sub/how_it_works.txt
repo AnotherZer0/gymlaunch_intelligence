@@ -1,0 +1,295 @@
+================================================================================
+ gymlaunch-sf-create-custom-weekly-sub-for-go-product — HOW THIS WORKS
+================================================================================
+
+WHAT IT IS
+----------
+An on-demand Lambda that, given one customer, creates a one-year subscription
+for the GO product in SubscriptionFlow ("SF" from here on). You hit it with a
+single HTTP request carrying a customer id or email; it finds-or-creates that
+customer in SF and then creates the subscription for them. One request in, one
+subscription out.
+
+The subscription it makes is a "Termed" subscription: a FIXED-TERM subscription
+that ENDS after its term (here, one year) rather than rolling over forever. The
+other SF subscription kind is "Evergreen", which renews indefinitely — that is
+NOT what this builds. So a customer subscribed through this endpoint bills for
+one year and then the subscription stops on its own.
+
+The billing rhythm is WEEKLY, but — read this twice — the weekly cadence is NOT
+set anywhere in this Lambda's code. It comes from the SF PLAN. The default plan
+id this Lambda sends (f359c92d-...) must itself be configured as a weekly plan
+in the SF dashboard. If someone reconfigures that plan to monthly in SF, this
+code keeps sending the same payload and the customer silently gets billed
+monthly. The code cannot tell. The cadence lives in SF, not here.
+
+The first invoice SF generates is left in DUE state. The Lambda does NOT pay it
+(pay_invoice is False, see below). Nobody's card gets charged by this endpoint.
+
+
+WHERE IT LIVES
+--------------
+  Lambda name:  gymlaunch-sf-create-custom-weekly-sub-for-go-product
+  Code:         src/subscriptionflow/create_sub/handler.py
+  Trigger:      a Lambda Function URL — MANUALLY MANAGED (see next section).
+  Secret:       gymlaunch/subscriptionflow/api  — a JSON secret with three keys:
+                  client_id        -> env SF_CLIENT_ID
+                  client_secret    -> env SF_CLIENT_SECRET
+                  endpoint_api_key -> env SF_ENDPOINT_API_KEY
+                scripts/deploy.sh reads the secret and injects those three env
+                vars at deploy time.
+  Token cache:  Postgres table subscriptionflow_oauth_token (migration 013).
+                The Lambda runs in the VPC so it can reach RDS for that table
+                and reaches the SF API over the VPC's existing egress path.
+
+
+WHY THE FUNCTION URL IS MANUALLY MANAGED
+----------------------------------------
+This is the same situation as gymlaunch-add-slack-channel. The deploy IAM user
+does NOT have lambda:CreateFunctionUrlConfig, so it cannot create or change a
+Function URL. The SAM stack (infra/template.yaml) therefore provisions
+EVERYTHING ELSE about this function — the role, the VPC config, the env vars —
+but it does NOT define the Function URL.
+
+The Function URL is enabled BY HAND in the AWS console, once, after the function
+first exists. The good news: because CloudFormation does not manage the URL, the
+URL PERSISTS across every later `sam deploy`. You set it up once and forget it.
+If the URL ever disappears, it was deleted manually — re-create it in the
+console; redeploying will not bring it back (or take it away).
+
+
+HOW CALLERS AUTHENTICATE TO THIS ENDPOINT
+-----------------------------------------
+There are TWO layers of auth and they are completely separate. Don't confuse
+them.
+
+  Layer 1 — caller -> this Lambda (a shared secret you control):
+    The request must present the shared secret, which must match the
+    SF_ENDPOINT_API_KEY env var (the endpoint_api_key from the secret). It can
+    arrive EITHER as:
+        the  x-api-key  header,   OR
+        a    ?key=<secret>  query-string parameter.
+    Wrong/missing key => HTTP 401 {"ok": false, "error": "unauthorized"} and
+    the Lambda does nothing else. This check happens FIRST, before any DB or SF
+    call.
+
+  Layer 2 — this Lambda -> SF (OAuth2, you don't manage this directly):
+    Described in the next section. The caller never sees an SF token.
+
+
+HOW THE LAMBDA AUTHENTICATES TO SUBSCRIPTIONFLOW (OAuth2)
+---------------------------------------------------------
+SF uses an OAuth2 client-credentials grant. The flow:
+
+  1. The Lambda POSTs client_id + client_secret to the token URL
+     (https://gymlaunch.subscriptionflow.com/oauth/token) with
+     grant_type=client_credentials, and gets back a short-lived bearer
+     access_token plus an expires_in.
+
+  2. That token is CACHED in the subscriptionflow_oauth_token table, which is a
+     SINGLETON — exactly one row, id = 1. Every invocation reads that one row.
+     Re-fetching a token on every single call would be wasteful and could hit
+     SF rate limits, so we hold one and reuse it until it's near expiry.
+
+  3. The token is rotated IN-BAND (the Lambda refreshes it itself; there is no
+     separate cron). Two triggers cause a rotation:
+
+       PROACTIVE: get_token() checks the cached token's expires_at. If it's
+       missing, or within TOKEN_EXPIRY_BUFFER (60s) of expiring, the Lambda
+       fetches a fresh one and writes it back to row id=1 BEFORE using it. The
+       60s buffer exists so we don't hand SF a token that expires mid-call.
+
+       REACTIVE: if SF returns 401 on an actual API call anyway (token revoked
+       early, clock skew, whatever), sf_request() rotates the token ONCE and
+       retries that same call one time. If the retry still fails, the error
+       propagates. This is the safety net for "the proactive check thought the
+       token was fine but SF disagreed."
+
+  The rotated token is carried in a one-element list (token_box) so that when a
+  401-retry rotates it, the new token propagates to all later calls in the same
+  invocation instead of being lost.
+
+
+WHAT YOU SEND IT (INPUT)
+------------------------
+The Lambda accepts a JSON body, query-string parameters, or both. If a JSON
+body is present, its fields WIN over the same-named query-string params (the
+query string is parsed first, then the body is merged on top).
+
+  id              SF customer id.        Optional. Tried FIRST if present.
+  email           customer email.        Required if id is missing or the id
+                                         doesn't resolve. Also used as the
+                                         customer NAME when creating a new one.
+  price           per-item charge price. Optional — defaults to 0.00 (see the
+                                         price section below).
+  product_id      SF product id.         Optional — defaults to the GO product
+                                         (fe483af0-...).
+  plan_id         SF plan id.            Optional — defaults to f359c92d-...
+                                         (this is the plan that defines WEEKLY).
+  plan_price_id   SF charge id.          Optional — defaults to f73a8805-...
+                                         This is the KEY of the SF `charges`
+                                         object, not a dollar amount.
+  start_date      YYYY-MM-DD.            Optional — defaults to today (UTC).
+                                         Used for order_date, trigger_dates and
+                                         termed_start_date all at once.
+
+You must provide at least ONE of id or email. Neither => HTTP 400.
+
+
+HOW CUSTOMER FIND-OR-CREATE WORKS
+---------------------------------
+resolve_customer() tries three things, in order, and stops at the first hit:
+
+  1. BY ID (only if id was supplied): GET /customers/{id}. A clean 404/400, or
+     a 200 with no data.id, both mean "not found" — fall through. Note the
+     subtlety: SF can return 200 with an empty body for a missing id, so we
+     don't trust the status code alone; we check for data.id.
+
+  2. BY EMAIL (needs email): POST /customers/filter with
+     filter[email][$equals]=<email>. First matching row wins. If no email was
+     given and the id didn't resolve, that's a 400 — we have nothing to search
+     or create with.
+
+  3. CREATE: POST /customers with {name: email, email: email}. Yes, the name
+     is just the email address — that's deliberate; this endpoint doesn't
+     collect a separate display name. Returns the new SF customer id.
+
+The response field customer_created tells you which path happened: true means
+step 3 (a brand-new SF customer), false means we matched an existing one.
+
+
+HOW THE SUBSCRIPTION BODY IS BUILT
+----------------------------------
+build_subscription_body() assembles the POST /subscriptions payload. The
+load-bearing pieces:
+
+  type = "Termed"                     fixed-term, ends after the term.
+  termed_initial_period = 1
+  termed_initial_period_type = "year" => a ONE-YEAR term.
+
+  is_auto_renew = 0                   THIS is the lever that actually stops the
+                                      subscription rolling over after the year.
+
+  renewal_type = "Renew with Specific Term"
+  renewal_period = 1
+  renewal_period_type = "year"
+      SF *requires* renewal_type to be present for Termed subs (Evergreen subs
+      don't need it). Omitting it returns 422 "The renewal type field is
+      required." So even though is_auto_renew=0 is what really ends the sub,
+      renewal_type still has to be a valid non-empty value or SF rejects the
+      whole request. "Renew with Specific Term" is the value confirmed in the
+      SF OpenAPI spec. If SF ever introduces a literal "do not renew" value,
+      change the RENEWAL_TYPE constant.
+
+  items[0] = {
+    plan_id, product_id,
+    charges: { <plan_price_id>: { quantity: 1, price: <price> } }
+  }
+      Note the charges object is keyed BY plan_price_id — that id is a map key,
+      not a price.
+
+  pay_invoice = False
+      Leave the generated invoice DUE. Do NOT auto-charge. Enabling this would
+      fire SF's successful-payment logic, which we explicitly do not want here.
+
+order_date, trigger_dates and termed_start_date are all set to the resolved
+date (start_date, or today UTC).
+
+
+ABOUT THE PRICE (read before you trust a number)
+-------------------------------------------------
+If price is omitted or blank, it defaults to 0.00 (DEFAULT_PRICE). This is
+INTENTIONAL per the standing agreement: the subscription is created with a
+placeholder amount and the real amount is corrected after the fact in SF. So a
+zero-dollar subscription showing up in SF is expected behavior, not a bug, when
+the caller didn't pass a price.
+
+resolve_price() coerces whatever you send to a float. A non-numeric price
+(e.g. "abc") => HTTP 400. There is currently NO upper-bound or sanity check on
+the value — a fat-fingered 499.999 passes straight through to the SF charge.
+See docs/future_work.md (SubscriptionFlow entry) for the price-hardening item.
+
+
+WHAT YOU GET BACK (RESPONSE)
+----------------------------
+All responses are JSON with Content-Type: application/json.
+
+  Success (HTTP 200):
+    {
+      "ok": true,
+      "sf_customer_id": "...",
+      "sf_subscription_id": "...",
+      "customer_created": true|false
+    }
+
+  Failure: an HTTP 4xx/5xx with {"ok": false, "error": "..."}. Common cases:
+    401  bad/missing endpoint api key
+    400  no id and no email; bad start_date; non-numeric price
+    502  an SF call failed (token, lookup, create) — message includes the SF
+         status and a truncated snippet of SF's response
+    500  any other unexpected error
+
+
+DEBUG / DRY RUN (test safely before going live)
+-----------------------------------------------
+Set the env var DEBUG=1 in the Lambda console to turn on a SAFE DRY RUN. In this
+mode the Lambda:
+
+  - authenticates to SF and fetches/uses a token (real),
+  - looks up the customer READ-ONLY (by id, then email),
+  - returns the EXACT subscription body it WOULD have POSTed,
+
+and CREATES NOTHING — no customer, no subscription. The response includes
+"debug": true, what it received, what it resolved, whether it WOULD create a
+customer, and the full would_post_subscription_body. It never returns secret
+values. Use this to validate the very first live call before sending real
+traffic through.
+
+DEBUG accepts 1/true/yes/on (any case). Anything else (including the template
+default "0") means LIVE.
+
+IMPORTANT: a console change to DEBUG=1 is RESET to "0" on the next deploy,
+because the SAM template hardcodes DEBUG: "0". So if you flip it on to test,
+either flip it back yourself or know that the next deploy will do it for you.
+
+
+HOW TO CALL IT BY HAND
+----------------------
+Replace <FUNCTION_URL> with the manually-created Function URL and <KEY> with the
+endpoint_api_key from the secret. Header form:
+
+  curl -sS -X POST "<FUNCTION_URL>" \
+    -H "x-api-key: <KEY>" \
+    -H "Content-Type: application/json" \
+    -d '{"email":"customer@example.com","price":97.00}'
+
+Query-param form (same effect, key in the URL):
+
+  curl -sS -X POST "<FUNCTION_URL>?key=<KEY>" \
+    -H "Content-Type: application/json" \
+    -d '{"id":"<sf_customer_id>"}'
+
+A safe first test: set DEBUG=1 in the console, run either command, and read the
+would_post_subscription_body in the response. When it looks right, set DEBUG
+back to 0 and run for real.
+
+(NOTE: the gymlaunch-deploy IAM user CANNOT read CloudWatch logs and CANNOT
+create the Function URL. Read logs from the browser console; the curl response
+body is your other source of visibility.)
+
+
+KNOWN GAPS / WATCH-OUTS
+-----------------------
+See docs/future_work.md, "SubscriptionFlow integration — hardening + spin-out",
+for the full list. The short version:
+
+  - Price is unvalidated and defaults to 0.00 (covered above).
+  - Weekly cadence depends on the SF plan config, NOT this code — confirm plan
+    f359c92d-... is a weekly plan in the SF dashboard, or the cadence is wrong
+    no matter what this Lambda does.
+  - The token table is a single-tenant singleton (id=1 CHECK). If SF ever holds
+    more than one GymLaunch account, this needs a key per tenant.
+  - There is no lock around token rotation, so two simultaneous cold starts
+    could both rotate; harmless today because SF issues a fresh token each time.
+  - renewal_type is confirmed only as "Renew with Specific Term" from the SF
+    OpenAPI spec (docs/vendor/subscriptionflow/openapi.json).

@@ -71,90 +71,56 @@ User was deciding — ask them before writing any code.
 
 ---
 
-## [open] Fathom nightly API sync
+## [in-progress] Fathom nightly API sync
 
 **Captured:** 2026-05-16
+**Started:** 2026-06-24
 
-**Revisit when:** Fathom API details are available (endpoint shape, field names,
-pagination) and a Lambda name is chosen.
+**Status:** Code written (2026-06-24). Lambda `gymlaunch-fathom-daily-sync`.
+Schedule: `cron(0 4 * * ? *)` — 4am UTC (11pm CDT).
+**Needs deploy:** `bash scripts/deploy.sh`, then set `FULL_SYNC=true` in Lambda console + invoke for first backfill.
 
 **Why it matters:**
-The live webhook path (Zapier → `gymlaunch-fathom-webhook`) is the fast path but
-is not guaranteed delivery. If Zapier has downtime, a zap fails silently, or calls
-occurred before the webhook was set up, those calls never land in the DB. A nightly
-sync against the Fathom API is the safety net — it pulls all calls within a rolling
-window and upserts them idempotently on `fathom_id`. First run backfills all
-historical calls; subsequent runs cover a rolling 48h window to catch webhook gaps.
+Replacing the webhook (Zapier → `gymlaunch-fathom-webhook`) as the primary data source.
+Webhook stays alive as a low-cost insurance policy. Nightly sync via Fathom API is more
+reliable and removes Zapier as a dependency.
 
-**What to build:**
-1. New Lambda (name TBD — ask user before writing code) in `src/fathom/sync/`
-2. Hits Fathom API, paginates through calls filtered to last N hours (48h default,
-   configurable via Lambda event payload for manual backfills)
-3. Maps API response fields → `fathom_call` + `fathom_call_invitee` columns
-   (field names may differ from webhook payload — verify against API docs)
-4. Upserts on `fathom_id` — identical conflict logic to webhook handler
-5. Add to `infra/template.yaml` on a nightly EventBridge schedule (e.g. `cron(0 6 * * ? *)` — 1am CDT)
-6. Fetch `gymlaunch/fathom/Fathom-API-Key` from Secrets Manager, add to `deploy.sh`
-
-**Blocked on:** Fathom API docs / sample response to confirm field mapping.
+**Design:**
+- Normal run: `GET /meetings?after=48h_ago&include_transcript=true`
+- Full sync: `FULL_SYNC=true` env var → paginate ALL meetings → batch-check IDs against DB
+  → only fetch transcripts for meetings NOT already in DB (avoids redundant API calls)
+- Upsert on `fathom_id` — idempotent
+- Code: `src/fathom/sync/handler.py`
+- Fathom API key: `gymlaunch/fathom/Fathom-API-Key` (key: `api_key`), `X-Api-Key` header
+- Rate limit: 60 req/min
 
 ---
 
-## [open] Fathom summary PATCH endpoint
+## [abandoned] Fathom summary PATCH endpoint
 
 **Captured:** 2026-05-16
+**Abandoned:** 2026-06-24
 
-**Revisit when:** n8n → Claude summary pipeline is ready to be built.
+**Why abandoned:**
+The summary pipeline (n8n → Claude API → PATCH → DB) was designed when we thought
+we needed summaries to control token cost at AI brain query time. Decided against it
+because: (1) Claude's 200k context window handles 15–20 full call transcripts
+comfortably; (2) the extra infrastructure (n8n workflow, PATCH endpoint, second API
+call per call) isn't worth it at current call volume; (3) full transcripts give the
+AI brain richer context without a lossy summarization step.
 
-**Why it matters:**
-The `fathom_call.summary` column exists but is always NULL. The intended pipeline
-is: n8n polls for NULL summaries → sends `transcript_plaintext` to Claude API →
-Claude returns a short summary → n8n calls a PATCH endpoint to write it back.
-That PATCH endpoint doesn't exist yet.
-
-**What to build:**
-1. New route `PATCH /fathom/summary` on the existing `SmsApi` API Gateway
-2. Accepts JSON body: `{"fathom_id": "...", "summary": "..."}`
-3. Validates `X-Webhook-Secret` header (same secret as webhook handler)
-4. Updates `fathom_call SET summary = $1 WHERE fathom_id = $2`
-5. Returns 404 if `fathom_id` not found, 200 on success
-6. Can live in the existing `gymlaunch-fathom-webhook` Lambda (add a second route)
-   or a new Lambda — ask user before writing code
-
-**See also:** summary design note below (two-tier retrieval strategy).
+The `fathom_call.summary` column stays NULL and can be dropped in a future migration
+if it gets in the way. Do not build this endpoint.
 
 ---
 
-## [open] Fathom summary pipeline + two-tier retrieval design
+## [abandoned] Fathom summary pipeline + two-tier retrieval design
 
 **Captured:** 2026-05-16
+**Abandoned:** 2026-06-24
 
-**Revisit when:** ready to build the n8n → Claude → write-back pipeline and/or
-the first AI brain query that touches call data.
-
-**Decision made (don't re-litigate):**
-Keep both `transcript_plaintext` and `summary`. They serve different purposes.
-Feeding raw transcripts to an agent for a "last 30 days" query costs ~100–150k
-tokens for a typical client with 15 calls. Summaries (~300 tokens each) cut that
-to ~4,500 tokens for the first pass, with full transcripts fetched selectively
-when a summary flags something worth digging into. 10–15x cheaper, same output
-quality.
-
-**Two-tier retrieval pattern:**
-1. Agent reads all summaries for the time window → gets shape of the period
-2. Agent identifies calls worth examining closely → fetches specific full transcripts
-This is essentially RAG applied to call transcripts.
-
-**What to build when picking this up:**
-1. Decide on summary structure — flat string ("10 second summary") vs. structured
-   output (key topics, outcome, action items / commitments). Structured is more
-   useful for the agent's first-pass scan but requires a richer Claude prompt.
-   Flat string is simpler to store and works fine for a v1.
-2. Build the summarization Lambda or n8n workflow: poll for `summary IS NULL` →
-   send `transcript_plaintext` to Claude API → write back via PATCH endpoint
-3. Build the PATCH endpoint (see separate entry above)
-4. When building the AI brain query layer, always start with summaries and only
-   pull full transcripts when the agent determines a specific call is relevant.
+**Why abandoned:** see "Fathom summary PATCH endpoint" entry above. Full transcripts
+are used directly by the AI brain. The `summary` column stays NULL.
 
 ---
 
@@ -404,6 +370,19 @@ more." The current shape is deliberately minimal; several things were parked:
    plan, unknown plan → 400. **Open decisions (unanswered):** catalog home
    (env-var JSON like `TWILIO_NUMBER_CHANNELS` vs in-code dict vs DB table) and
    whether entries carry full shape (recommended) or IDs only.
+7. **Price input hardening (deferred 2026-06-24).** Confirmed end-to-end working
+   under good input, but `resolve_price` only does `float(raw)` — so junk like
+   `499.999` passes straight through to the SF charge. **Revisit before the
+   endpoint takes arbitrary user/typed input.** Decisions to make:
+   - **>2 decimal places** (`499.999`): round to 2dp for currency, or reject 400?
+   - **Formatted strings** (`"$49"`, `"1,234.00"`, `"49 USD"`): currently 400
+     `price must be numeric`. Add a sanitizer (strip `$`, `,`, whitespace) or keep
+     strict? (Depends whether the webhook source can send formatted values.)
+   - **Negative / zero / absurd values**: reject `< 0`? cap an upper bound? (Note
+     `0` is the current default-when-omitted, so it must stay allowed.)
+   Lower urgency because `pay_invoice` is off — a bad price creates a wrong-amount
+   DUE invoice, not a live charge — but it's still bad data. Lives in
+   `resolve_price()` in `src/subscriptionflow/create_sub/handler.py`.
 
 **Setup still required before first use (one-time):**
 - Create Secrets Manager secret `gymlaunch/subscriptionflow/api` with JSON

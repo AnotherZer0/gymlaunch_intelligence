@@ -1,0 +1,108 @@
+================================================================================
+ gymlaunch-project-note-sync — HOW THIS WORKS
+================================================================================
+
+This is the SHORT version — just enough to understand the design at a glance.
+The full operator's guide (SQL queries, reset/backfill scenarios, log reading,
+the API-scope gotcha, every edge case) lives in:
+
+    docs/system_reference.md  →  section "HubSpot Project-Note Sync"
+
+Read that doc whenever you need to actually DO something to this Lambda. This
+file only explains the shape of it.
+
+
+WHAT IT IS
+----------
+A scheduled Lambda that back-fills associations onto HubSpot notes. When a note
+is attached to a HubSpot Project, this job makes sure that note is ALSO directly
+associated with that project's companies and contacts. That way the note shows
+up in the company/contact activity feed (and is reachable by the future AI
+brain), instead of being stranded on the Project where nothing else can see it.
+
+It runs on a timer, not on a webhook, because HubSpot does not fire a useful
+webhook when a note is created against the Projects object. So we poll instead.
+
+
+WHERE IT LIVES
+--------------
+  Lambda name:  gymlaunch-project-note-sync
+  Code:         src/sync/hubspot_project_notes/handler.py
+  Schedule:     rate(72 hours)  — every 3 days (drifts off clock time; this is a
+                background maintenance job, so the drift does not matter)
+  Secret:       gymlaunch/hubspot/token  — injected as the HUBSPOT_TOKEN env var.
+  DB:           runs in-VPC; reads/writes the hubspot_project_note_sync table.
+  State table:  hubspot_project_note_sync (migration 008). One row per
+                (note_id, project_id) pair the Lambda has ever touched.
+
+
+THE NOTES-FIRST DESIGN (the important part)
+-------------------------------------------
+The obvious design would be "projects-first": list every Project, then fan out
+to its notes. We CANNOT do that. The Projects list-instances endpoint
+(/crm/v3/objects/0-970) is gated behind a scope that is NOT available to Private
+Apps for our portal — it returns "The scope needed for this API call isn't
+available for public use." It is not a fixable missing-scope error; a HubSpot
+support ticket is pending.
+
+So instead we go NOTES-FIRST. The v4 *associations* endpoints all work normally
+(note→projects, project→companies, project→contacts, note→companies,
+note→contacts), so we start from recently-modified notes and walk outward
+through associations. We never have to list Projects.
+
+
+WHAT A RUN DOES (high level)
+----------------------------
+  1. Search notes modified in the last LOOKBACK window (default 96h).
+  2. For each batch of notes, read note→project associations. Drop any note not
+     attached to a project.
+  3. For each unique project, read its companies and contacts.
+  4. Build candidate (note, project) pairs. Check each against the state table —
+     skip pairs whose project snapshot is unchanged AND both sides already synced.
+  5. For pairs that still need work, read the note's CURRENT associations.
+  6. Desired set per note = UNION of every linked project's companies + contacts.
+     Diff against current, then batch-CREATE only the missing associations.
+  7. Upsert a state row per pair, recording per-side success. The Lambda is
+     purely ADDITIVE — it never removes an existing association.
+
+Partial failures are remembered: if one side (companies or contacts) fails, its
+synced_at is left NULL so a retry index resurfaces that pair next run.
+
+
+THE 72h SCHEDULE + 96h LOOKBACK
+-------------------------------
+The schedule fires every 72 hours. The lookback window is 96 hours — wider than
+the schedule on purpose. That 24h of overlap means if one run is skipped or
+fails, the next run's window still re-covers the gap. Re-processing an
+already-synced pair is cheap: it gets skipped at the state-table check in step 4.
+
+You can override the window for a one-off backfill by invoking with a payload
+like {"lookback_hours": 2160}. (HubSpot's search caps at 10,000 results; a window
+larger than that logs a WARNING and processes only the oldest 10k.)
+
+
+THE ADVISORY LOCK
+-----------------
+At startup the handler takes pg_try_advisory_lock(hashtext('project_note_sync')).
+If it can't get the lock, another run is already in progress and this invocation
+exits immediately with "Another project-note sync is running, exiting". This
+prevents two overlapping runs from double-processing the same notes. Same pattern
+as the Asana and other HubSpot syncs.
+
+
+KNOWN GAP (accepted by design)
+------------------------------
+HubSpot does NOT bump a note's hs_lastmodifieddate when its associations change.
+So an OLD note that gets newly attached to a project later will not surface in
+the modified-since search and won't be processed. The workflow assumption is that
+notes are created fresh on a project, so this is rare. A project-polling
+mitigation is described in system_reference.md but is not built.
+
+
+FOR EVERYTHING ELSE
+-------------------
+SQL to inspect state, how to run a manual backfill, how to reset/re-sync, how to
+read the CloudWatch logs, the full API-scope explanation, and the per-edge-case
+behavior table are all in:
+
+    docs/system_reference.md  →  "HubSpot Project-Note Sync"
