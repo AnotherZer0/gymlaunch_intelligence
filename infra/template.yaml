@@ -61,6 +61,18 @@ Parameters:
   LeadDb2SheetId:
     Type: String
     Description: "Google Sheet ID for the `Lead Integration Database V2.0` workbook (contains the `00 - Database` master client tab)."
+  SfClientId:
+    Type: String
+    NoEcho: true
+    Description: "SubscriptionFlow OAuth2 client_id (client-credentials grant)."
+  SfClientSecret:
+    Type: String
+    NoEcho: true
+    Description: "SubscriptionFlow OAuth2 client_secret (client-credentials grant)."
+  SfEndpointApiKey:
+    Type: String
+    NoEcho: true
+    Description: "Shared secret callers must present (x-api-key header or ?key=) to the SF subscribe Function URL."
 
 Globals:
   Function:
@@ -426,6 +438,37 @@ Resources:
             Name: gymlaunch-lead_db2-sheet-sync-daily
             Enabled: true
 
+  # SubscriptionFlow "create custom weekly sub for GO product" endpoint.
+  # Invoked via a Lambda Function URL. As with gymlaunch-add-slack-channel, the
+  # deploy IAM user cannot create Function URLs (lambda:CreateFunctionUrlConfig
+  # is not granted), so this stack provisions the function — role, VPC, env vars
+  # — but the Function URL itself is enabled MANUALLY in the console after
+  # deploy. The URL persists across SAM deploys because CloudFormation does not
+  # manage it. The function needs the VPC for RDS (token cache) and reaches the
+  # SF API over the VPC's existing egress path.
+  SfCreateGoSubFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-sf-create-custom-weekly-sub-for-go-product
+      CodeUri: ../src/subscriptionflow/create_sub/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          SF_CLIENT_ID: !Ref SfClientId
+          SF_CLIENT_SECRET: !Ref SfClientSecret
+          SF_ENDPOINT_API_KEY: !Ref SfEndpointApiKey
+          # Dry-run switch. "0" = live; set to "1" in the console for a SAFE dry
+          # run (authenticates, fetches token, read-only customer lookup, then
+          # returns the subscription body it WOULD post — creates nothing).
+          # NOTE: a console change to "1" is reset to "0" on the next deploy.
+          DEBUG: "0"
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+
 Outputs:
   SlackFunctionArn:
     Value: !GetAtt SlackSyncFunction.Arn
@@ -453,6 +496,9 @@ Outputs:
     Value: !GetAtt SupabaseLeadSyncFunction.Arn
   LeadDb2SheetSyncFunctionArn:
     Value: !GetAtt LeadDb2SheetSyncFunction.Arn
+  SfCreateGoSubFunctionArn:
+    Value: !GetAtt SfCreateGoSubFunction.Arn
+    Description: "SubscriptionFlow subscribe endpoint — enable a Function URL on this function in the console."
   FathomWebhookUrl:
     Value: !Sub "https://${SmsApi}.execute-api.${AWS::Region}.amazonaws.com/fathom/webhook"
     Description: "Fathom call transcript webhook — point Zapier here"

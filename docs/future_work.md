@@ -345,3 +345,71 @@ operational complexity (managing additional Postgres roles, per-Lambda
 connection switching). B2 wins on simplicity.
 
 ---
+
+## [open] SubscriptionFlow integration — hardening + spin-out
+
+**Captured:** 2026-06-23
+
+**Revisit when:** a second SF use case appears (anything beyond the single GO-product
+subscribe endpoint), or SF accounts go multi-tenant, or the GO product's real
+charge price is finalized.
+
+**Why it matters:**
+This started as a single Lambda (`gymlaunch-sf-create-custom-weekly-sub-for-go-product`)
+plus a one-row OAuth token table. The user said it "will eventually spin out into
+more." The current shape is deliberately minimal; several things were parked:
+
+**Parked items:**
+1. **Placeholder charge price.** When the incoming request omits `price`, the
+   line-item charge defaults to **0.00** (agreed: "default to 0, we can fix it
+   after the fact"). The invoice is left **due** (pay_invoice is off — see below),
+   so a missing price produces a $0 invoice sitting in due/unpaid state. Revisit
+   once the real GO-product price is known — change `DEFAULT_PRICE` in
+   `src/subscriptionflow/create_sub/handler.py`, or make the caller always send `price`.
+2. **Weekly cadence comes from the SF plan, not the code.** Clarified 2026-06-23:
+   the goal is "a weekly subscription that runs for 1 year then ends." `type: "Termed"`
+   + `termed_initial_period: 1` + `..._type: "year"` correctly encodes the 1-year
+   fixed term that ends (Termed = ends; Evergreen = renews forever). But `POST
+   /subscriptions` has **no billing-frequency field** — the weekly cadence is
+   defined by the SF plan/price config. **Action: confirm the default plan
+   `f359c92d-c0d7-4594-961a-f46158cb459f` is configured as a WEEKLY plan in the
+   SF dashboard.** If it isn't, the cadence will be wrong regardless of this code.
+3. **Single-tenant token table.** `subscriptionflow_oauth_token` is a singleton
+   (`id = 1` CHECK). If SF ever holds multiple GymLaunch accounts, drop the
+   singleton constraint and add an account-key column. See migration
+   `013_subscriptionflow_schema.sql`.
+4. **No proactive concurrency lock on rotation.** Rotation is in-band (proactive
+   on expiry + reactive on 401). Within one invocation this is race-free, but two
+   simultaneous cold invocations could both rotate. SF issues a fresh token each
+   time and we UPSERT the latest, so the worst case is a redundant token fetch —
+   acceptable for current low volume. Add a DB advisory lock if call volume rises.
+5. **Vendor docs.** SF OpenAPI spec lives at
+   `docs/vendor/subscriptionflow/openapi.json` for future endpoint work
+   (cancel/suspend/resume, invoices, etc.).
+6. **Named-plan registry (deferred 2026-06-23 — "ship simple now").** Today the
+   caller relies on hardcoded ID defaults (or passes raw `product_id`/`plan_id`/
+   `plan_price_id`), and the subscription shape (Termed/1yr/`pay_invoice:false`)
+   is hardcoded. **Revisit when a SECOND product/plan appears.** Replace the raw
+   IDs with a `plan` name the caller sends (e.g. `"plan": "weekly_go_custom"`)
+   that maps to a catalog entry carrying the **full subscription shape**, so new
+   plans (monthly, evergreen, auto-charging) need no code change:
+       "weekly_go_custom": {
+         "product_id": "fe483af0-...", "plan_id": "f359c92d-...",
+         "plan_price_id": "f359c92d-...", "type": "Termed",
+         "termed_initial_period": 1, "termed_initial_period_type": "year",
+         "pay_invoice": false
+       }
+   Per-customer values (`id`, `email`, `price`, `start_date`) stay in the payload.
+   Keep backward-compat: `plan` optional, explicit IDs override, no plan → default
+   plan, unknown plan → 400. **Open decisions (unanswered):** catalog home
+   (env-var JSON like `TWILIO_NUMBER_CHANNELS` vs in-code dict vs DB table) and
+   whether entries carry full shape (recommended) or IDs only.
+
+**Setup still required before first use (one-time):**
+- Create Secrets Manager secret `gymlaunch/subscriptionflow/api` with JSON
+  `{"client_id","client_secret","endpoint_api_key"}`.
+- Run migration `013_subscriptionflow_schema.sql`.
+- `bash scripts/deploy.sh`, then enable a Function URL on the function in the
+  console (deploy IAM user can't create Function URLs — same as add-slack-channel).
+
+---

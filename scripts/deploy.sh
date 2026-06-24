@@ -67,6 +67,20 @@ SUPABASE_SERVICE_ROLE_KEY=$(echo "$SUPABASE_SECRET_JSON" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['service_role_key'])")
 unset SUPABASE_SECRET_JSON
 
+# SubscriptionFlow OAuth2 client-credentials + the shared key callers must present
+# to the subscribe Function URL. Stored as one JSON secret:
+#   {"client_id": "...", "client_secret": "...", "endpoint_api_key": "..."}
+SF_SECRET_JSON=$(aws secretsmanager get-secret-value \
+  --secret-id gymlaunch/subscriptionflow/api \
+  --query SecretString --output text)
+SF_CLIENT_ID=$(echo "$SF_SECRET_JSON" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['client_id'])")
+SF_CLIENT_SECRET=$(echo "$SF_SECRET_JSON" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['client_secret'])")
+SF_ENDPOINT_API_KEY=$(echo "$SF_SECRET_JSON" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['endpoint_api_key'])")
+unset SF_SECRET_JSON
+
 # From address for the daily finance report email (domain must be verified in SES us-east-1)
 SES_FROM_ADDRESS="reports@gymlaunch.com"
 SES_TO_ADDRESS="ap@gymlaunchsecrets.com"
@@ -103,7 +117,10 @@ sam deploy \
     "SesToAddress=${SES_TO_ADDRESS}" \
     "SupabaseUrl=${SUPABASE_URL}" \
     "SupabaseServiceRoleKey=${SUPABASE_SERVICE_ROLE_KEY}" \
-    "LeadDb2SheetId=${LEAD_DB2_SHEET_ID}"
+    "LeadDb2SheetId=${LEAD_DB2_SHEET_ID}" \
+    "SfClientId=${SF_CLIENT_ID}" \
+    "SfClientSecret=${SF_CLIENT_SECRET}" \
+    "SfEndpointApiKey=${SF_ENDPOINT_API_KEY}"
 
 echo "Setting log retention..."
 set_retention() {
@@ -123,6 +140,7 @@ set_retention /aws/lambda/gymlaunch-stripe-finance-report
 set_retention /aws/lambda/gymlaunch-project-note-sync
 set_retention /aws/lambda/gymlaunch-supabase-lead-sync
 set_retention /aws/lambda/gymlaunch-lead_db2-sheet-sync
+set_retention /aws/lambda/gymlaunch-sf-create-custom-weekly-sub-for-go-product
 # gymlaunch-add-slack-channel is managed manually (not in the SAM stack — see template.yaml),
 # but we still set log retention on it here for hygiene.
 set_retention /aws/lambda/gymlaunch-add-slack-channel

@@ -5,6 +5,27 @@
 Always ask the user what to name the Lambda function before writing any code.
 Do not invent or reuse a name without explicit confirmation.
 
+## Database migrations
+
+Lambdas connect to RDS as **`gls_writer`** (the `DB_USER` env var). Migrations,
+however, are often applied as a **personal/admin DB user**. In Postgres a table is
+owned by whoever created it, and a table created by the personal user grants
+`gls_writer` **nothing** — the Lambda then fails at runtime with
+`42501 permission denied for table <name>`.
+
+Therefore, **every migration that creates a table or sequence MUST include an
+explicit `GRANT` to `gls_writer`** in the same file:
+
+- `GRANT SELECT, INSERT, UPDATE[, DELETE] ON <table> TO gls_writer;` — grant only
+  the verbs the consuming code actually uses (least privilege).
+- For any `SERIAL`/`BIGSERIAL`/identity column, also
+  `GRANT USAGE, SELECT ON SEQUENCE <seq> TO gls_writer;`.
+
+These grants are idempotent and harmless when the migration is instead applied as
+`gls_writer` (it just grants to itself). First codified after migration `013`
+(`subscriptionflow_oauth_token`) hit this. The older tables predate the personal
+user, so they were created as `gls_writer` and don't need it — but all new ones do.
+
 ## File write location
 
 Always write files directly to `/mnt/data/gymlaunch_intelligence/` (the main repo path),
