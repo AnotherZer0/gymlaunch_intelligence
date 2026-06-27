@@ -1,0 +1,6 @@
+pg8000==1.31.2
+# Floor (not an exact pin like the other Lambdas): the summarizer passes
+# thinking={"type":"adaptive"} and model="claude-opus-4-8" straight through to the
+# API, so any reasonably recent SDK works. Pin an exact version after the first
+# successful `sam build` if you want full reproducibility.
+anthropic>=0.40.0

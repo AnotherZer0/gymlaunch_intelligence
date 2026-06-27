@@ -46,6 +46,8 @@ but changing it would require tearing down and recreating all resources, so it s
 | `gymlaunch-lead_db2-sheet-sync` | Daily at 07:00 UTC (one hour before supabase-lead-sync) | `src/sync/lead_db2_sheet/` |
 | `gymlaunch-add-slack-channel` | Function URL (on-demand, HubSpot-triggered) — **manually managed, see note** | `src/slack/add_channel/` |
 | `gymlaunch-sf-create-custom-weekly-sub-for-go-product` | Function URL (on-demand) — **manually managed, see note** | `src/subscriptionflow/create_sub/` |
+| `gymlaunch-client-identity-resolver` | Once daily | `src/identity/resolver/` |
+| `gymlaunch-client-pulse-summary` | Every 14 days | `src/pulse/summary/` |
 
 All functions run in the VPC (subnets `subnet-a085c381`, `subnet-3d566b33`) so they can reach RDS.  
 All share IAM role `gymlaunch-slack-sync` (role named after first Lambda — same naming quirk as stack).  
@@ -76,6 +78,8 @@ and its Function URL + public permission added in the console. `deploy.sh` only 
 /aws/lambda/gymlaunch-lead_db2-sheet-sync
 /aws/lambda/gymlaunch-add-slack-channel
 /aws/lambda/gymlaunch-sf-create-custom-weekly-sub-for-go-product
+/aws/lambda/gymlaunch-client-identity-resolver
+/aws/lambda/gymlaunch-client-pulse-summary
 ```
 
 Retention: 30 days (set by deploy script).
@@ -101,6 +105,7 @@ All secrets are in `us-east-1`.
 | `gymlaunch/slack/channel_add_key` | `api_key` | `gymlaunch-add-slack-channel` (Function URL secret) |
 | `gymlaunch/fathom/Fathom-API-Key` | `api_key` | `gymlaunch-fathom-sync` (nightly sync, in progress) |
 | `gymlaunch/subscriptionflow/api` | `client_id`, `client_secret`, `endpoint_api_key` | `gymlaunch-sf-create-custom-weekly-sub-for-go-product` |
+| `gymlaunch/anthropic/api_key` | `api_key` | `gymlaunch-client-pulse-summary` |
 
 The Google service account JSON is base64-encoded by deploy.sh and passed as
 `GOOGLE_SERVICE_ACCOUNT_B64`. It must have Editor access to the Google Sheet.
@@ -133,6 +138,7 @@ The Google service account JSON is base64-encoded by deploy.sh and passed as
 | `db/migrations/011_client_lead_master_add_api_key.sql` | Adds `hl_sub_account_api_key` column to `client_lead_master` |
 | `db/migrations/012_hubspot_coach_sync.sql` | Adds `hs_coach` column to `asana_agency_board_task` for HubSpot→Asana coach sync |
 | `db/migrations/013_subscriptionflow_schema.sql` | `subscriptionflow_oauth_token` table (singleton OAuth2 token cache) |
+| `db/migrations/014_client_period_summary.sql` | `client_period_summary` table + `client_account.active` flag; asserts `gls_writer` grants on the identity tables (`client_account`, `client_external_id`) now that the resolver writes them |
 
 ### Key Tables
 
@@ -158,6 +164,9 @@ The Google service account JSON is base64-encoded by deploy.sh and passed as
 | `supabase_facebook_lead_legacy` | Mirror of Supabase `Facebook Leads Database`. Predecessor of `supabase_facebook_lead` with different column names. |
 | `supabase_sync_state` | Per-table sync watermark — last run timestamp, row count, success/error status. PK: `table_name`. Despite the name, used as the generic state table by both `gymlaunch-supabase-lead-sync` and `gymlaunch-lead_db2-sheet-sync`. |
 | `subscriptionflow_oauth_token` | Singleton OAuth2 access token cache for SubscriptionFlow API. Rotated in-band (proactive on expiry + reactive on 401). |
+| `client_account` | Canonical client (one row per owner; multiple locations collapse into one). Defined in 001, first populated by `gymlaunch-client-identity-resolver`. `active=false` = churned (soft-deactivated, history kept). |
+| `client_external_id` | Address book: maps a `client_account` to each system's IDs — `(system, id_type, value)` e.g. `asana/task`, `hubspot/company`, `slack/channel`, `fathom/email`. `UNIQUE (system, id_type, value)`. |
+| `client_period_summary` | AI "pulse check" per (client, window) — `body`, `source_counts` (slack/asana/fathom item counts), `model`. Written by `gymlaunch-client-pulse-summary`. |
 | `client_lead_master` | Mirror of the `00 - Database` tab in the `Lead Integration Database V2.0` Google Sheet. Carries both auto-written fields (basic FB/GHL/Asana identifiers, populated by the n8n FB-lead workflow) and 10 manually-maintained diagnostic flags including `is_system_user` (Yes/No — sheet header is `system_user`, renamed because that's a PG 16+ reserved word), `fb_app_status`, `ghl_connection`. PK: `facebook_page_id`. Includes `hl_sub_account_api_key` (plaintext) as of migration 011 — future hardening tracked in `docs/future_work.md`. |
 
 ### Key Views
@@ -900,6 +909,67 @@ ORDER BY client_name;
 SELECT last_synced_at, last_row_count, last_status, last_error
 FROM supabase_sync_state
 WHERE table_name = 'client_lead_master';
+```
+
+---
+
+## AI Brain — Client Identity & Pulse
+
+Phase 1 of the unified client-activity layer. Two Lambdas turn the long-dormant
+identity tables (`client_account` / `client_external_id`, from migration 001)
+into the "address book" that ties a client's Slack, Asana, and Fathom activity
+to one canonical record, then summarizes it.
+
+### gymlaunch-client-identity-resolver (`src/identity/resolver/`)
+
+Daily, idempotent. The **first writer** to `client_account` / `client_external_id`.
+
+How each link is derived:
+- **asana** — `asana_agency_board_task` top-level cards with a `gym_name`:
+  `task_gid → (asana, task)`, `hubspot_company_id → (hubspot, company)`.
+- **slack** — **Tier-0 HubSpot read** (no mirror, nothing persisted from HubSpot
+  except the resulting link). Batch-reads the HubSpot company property holding the
+  Slack channel id for the companies we already track, via the same
+  `/crm/v3/objects/companies/batch/read` pattern as the coach sync. The property
+  internal name is auto-discovered from `/crm/v3/properties/companies` (logged),
+  or pinned via `SLACK_CHANNEL_PROPERTY`. `channel id → (slack, channel)` and sets
+  `slack_channel.client_account_id`.
+- **fathom** — derived from Slack: external (`is_internal=false`) posters in a
+  linked channel → their `slack_user.email` → `(fathom, email)`.
+
+**Owner grouping:** union-find merges cards sharing the same HubSpot channel value
+(primary) or the same `client_name` (fallback), so an owner's locations collapse
+into one `client_account`.
+
+**Churn:** a client with no live (uncompleted/still-present) card is set
+`active = false` (history kept); reappearing reactivates it.
+
+Env: `HUBSPOT_TOKEN`, optional `SLACK_CHANNEL_PROPERTY`, optional
+`DEFAULT_ORGANIZATION_ID`. Advisory-locked against concurrent runs.
+
+### gymlaunch-client-pulse-summary (`src/pulse/summary/`)
+
+Every 14 days. For each allowlisted, `active` client it gathers the window's
+Slack (via the `ai_readable_messages` view — sensitivity-filtered), Asana
+(tasks + comments for the client's `task` gids and their subtasks), and Fathom
+(`fathom_call` joined to `fathom_call_invitee.email`), resolved through
+`client_external_id`. It sends the bundle to Claude (`claude-opus-4-8`, adaptive
+thinking) and upserts the result into `client_period_summary` with
+`source_counts` + `model`. No delivery yet — query the table.
+
+Env: `ANTHROPIC_API_KEY`, `ALLOWLIST_CLIENT_ACCOUNT_IDS` (comma-separated test
+client ids), optional `WINDOW_DAYS` (14), `PULSE_MODEL` (`claude-opus-4-8`).
+
+```sql
+-- Latest pulse per client
+SELECT ca.name, s.period_start, s.period_end, s.source_counts, s.body
+FROM client_period_summary s
+JOIN client_account ca ON ca.id = s.client_account_id
+ORDER BY s.period_end DESC, ca.name;
+
+-- A client's resolved address book
+SELECT system, id_type, value FROM client_external_id
+WHERE client_account_id = :id ORDER BY system, id_type;
 ```
 
 ---

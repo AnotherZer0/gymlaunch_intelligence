@@ -22,6 +22,42 @@ response so the user remembers the context.
 
 ---
 
+## [open] HubSpot Tier-1 read-only company mirror
+
+**Captured:** 2026-06-26
+
+**Revisit when:** the AI brain needs HubSpot context beyond the Slack-channel
+property — e.g. contact emails as a more reliable Fathom key than Slack posters,
+deal/lifecycle stage, or owner attribution — OR the identity resolver's Slack
+linking proves too thin (companies without the channel property filled in).
+
+**Why it matters:**
+Phase 1 (`gymlaunch-client-identity-resolver`) deliberately uses **Tier 0**: an
+on-demand batch-read of the single HubSpot company Slack-channel property,
+persisting nothing from HubSpot except the resulting `client_external_id` link.
+That's enough to wire Slack + Fathom to a client, but the brain will eventually
+want richer HubSpot data in the DB (the memory note calls a `hubspot_contact`
+table the eventual "identity spine").
+
+**Agreed scope when we build it (Tier 1, NOT Tier 2):**
+- One narrow, **read-only** mirror table `hubspot_company` (`company_id` PK,
+  `name`, `owner_id`, `slack_channel`, `hs_lastmodifieddate`, `raw_payload`
+  jsonb, `synced_at`); later `hubspot_contact`.
+- **Incremental pull, no webhooks:** CRM Search filtered by
+  `hs_lastmodifieddate >= last_run` + a cursor/state row — the same
+  recently-modified-lookback pattern as `gymlaunch-project-note-sync`.
+- **Bounded to agency-client companies** (the IDs we already track via
+  `asana_agency_board_task.hubspot_company_id`), not the whole portal.
+- **Read-only inbound only.** The existing push sync
+  (`gymlaunch-sync-agency-board-to-hubspot`) stays separate — no bidirectional
+  write-conflict surface.
+- Reuses the existing `gymlaunch/hubspot/token` Private App credential.
+
+**Explicitly out of scope:** Tier 2 — a full bidirectional CRM mirror of all
+objects with real-time webhooks. Not planned.
+
+---
+
 ## [open] Phone validator rewrite + HubSpot workflow wiring
 
 **Captured:** 2026-05-22
@@ -390,5 +426,43 @@ more." The current shape is deliberately minimal; several things were parked:
 - Run migration `013_subscriptionflow_schema.sql`.
 - `bash scripts/deploy.sh`, then enable a Function URL on the function in the
   console (deploy IAM user can't create Function URLs — same as add-slack-channel).
+
+---
+
+## [open] SubscriptionFlow failed-payment alerting + daily data sync
+
+**Captured:** 2026-06-24
+
+**Revisit when:** the weekend Zapier test has shown what SF actually emits on a
+failed transaction, or sooner if we decide to build the daily sync first.
+
+**Goal:** a reliable **failed-payment alert system** for SubscriptionFlow.
+
+**Current interim step (user, this weekend):** SF dashboard webhook on failed
+transactions → Zapier, just to observe what real failures look like over the
+weekend. No code from us yet. Blocker on testing: can't reliably fabricate a
+decline — needs a gateway test-decline card on a customer with `pay_invoice:true`
+(only works in an SF sandbox/test gateway); on a live gateway you have to wait for
+organic failures.
+
+**Recommended architecture (both, not either/or):**
+1. **Webhook (fast, lossy)** — real-time ping for the alert. Eventually replace
+   Zapier with our own receiver Lambda (Function-URL or via the existing HttpApi)
+   that validates + writes to a table and fires the alert (Slack/SES/etc.).
+2. **Daily sync (reliable, complete)** — pull subs / transactions / invoices from
+   SF into RDS tables on a daily cron (like the other `gymlaunch-*-sync` Lambdas).
+   This is the reconciliation backbone: catches anything the webhook misses, is the
+   source of truth, and makes alert logic testable (just query `status = failed`).
+   Feeds the broader unified-activity / "AI brain" data layer.
+
+**Open decisions:**
+- Schema: tables for `sf_subscription`, `sf_transaction`, `sf_invoice` (+ GRANTs to
+  `gls_writer` per the CLAUDE.md migration rule). Identity: link to `client_account`
+  via SF customer_id in `client_external_id`.
+- Sync endpoints: `GET /subscriptions`, plus the transaction/invoice list endpoints
+  (need to confirm exact paths/filters in `docs/vendor/subscriptionflow/openapi.json`).
+- Full-load-then-incremental vs full daily pull; cadence; lookback window.
+- Alert channel + dedupe (don't re-alert the same failed txn from both webhook and
+  sync).
 
 ---

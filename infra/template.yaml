@@ -77,6 +77,10 @@ Parameters:
     Type: String
     NoEcho: true
     Description: "Fathom API key for the nightly sync. X-Api-Key header on all Fathom API requests."
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Description: "Claude API key for the client pulse-summary Lambda."
 
 Globals:
   Function:
@@ -499,6 +503,64 @@ Resources:
           - !Ref DbSecurityGroupId
         SubnetIds: !Ref SubnetIds
 
+  # --- AI Brain Phase 1 ---------------------------------------------------
+
+  # Populates the identity layer (client_account / client_external_id) from the
+  # Asana board + an on-demand HubSpot company-property read (Slack channel).
+  # Daily, idempotent. Needs HUBSPOT_TOKEN and VPC access to RDS.
+  ClientIdentityResolverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-client-identity-resolver
+      CodeUri: ../src/identity/resolver/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          HUBSPOT_TOKEN: !Ref HubspotToken
+          # HubSpot company-property internal name holding the Slack channel id.
+          # Leave empty to auto-discover (the chosen name is logged); set it here
+          # once known to pin it, then redeploy.
+          SLACK_CHANNEL_PROPERTY: ""
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        DailyResolve:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Name: gymlaunch-client-identity-resolver-daily
+            Enabled: true
+
+  # Bi-weekly client "pulse check": summarizes the last 14 days of Slack/Asana/
+  # Fathom for each allowlisted active client and stores it in client_period_summary.
+  ClientPulseSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-client-pulse-summary
+      CodeUri: ../src/pulse/summary/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+          # Comma-separated client_account ids to run the pulse on (the test
+          # clients). Intersected with client_account.active. Edit + redeploy.
+          ALLOWLIST_CLIENT_ACCOUNT_IDS: ""
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        BiweeklyPulse:
+          Type: Schedule
+          Properties:
+            Schedule: rate(14 days)
+            Name: gymlaunch-client-pulse-summary-biweekly
+            Enabled: true
+
 Outputs:
   SlackFunctionArn:
     Value: !GetAtt SlackSyncFunction.Arn
@@ -531,6 +593,10 @@ Outputs:
   SfCreateGoSubFunctionArn:
     Value: !GetAtt SfCreateGoSubFunction.Arn
     Description: "SubscriptionFlow subscribe endpoint — enable a Function URL on this function in the console."
+  ClientIdentityResolverFunctionArn:
+    Value: !GetAtt ClientIdentityResolverFunction.Arn
+  ClientPulseSummaryFunctionArn:
+    Value: !GetAtt ClientPulseSummaryFunction.Arn
   FathomWebhookUrl:
     Value: !Sub "https://${SmsApi}.execute-api.${AWS::Region}.amazonaws.com/fathom/webhook"
     Description: "Fathom call transcript webhook — point Zapier here"
