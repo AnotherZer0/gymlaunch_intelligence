@@ -5,6 +5,25 @@
 Always ask the user what to name the Lambda function before writing any code.
 Do not invent or reuse a name without explicit confirmation.
 
+## Debug / dry-run mode
+
+Every Lambda or job we build that performs writes or outward side-effects (external
+API calls, DB writes, creating records, sending messages, moving money) MUST ship with
+a **`DEBUG` / dry-run mode**, gated by an env var (default `"0"`, declared in
+`infra/template.yaml` so it's toggleable in the console):
+
+- When on, it exercises the real logic — auth, fetches, mapping — but performs **no
+  writes/side-effects**, and **returns** what it *would* do (the body it would POST, the
+  rows it would upsert, the records it would touch) in the invocation/HTTP response.
+- Put the dry-run output in the **response, not only `print()`** — the `gymlaunch-deploy`
+  user cannot read CloudWatch logs, so a dry run whose output only lands in logs is
+  useless. The response is where we read it.
+- Keeping the flag in the template resets it to off on every deploy, so a stray dry-run
+  flag can't survive to production. Pair with a `FULL_SYNC`-style flag for backfills.
+
+This is how we catch problems before touching live data (it caught the SF subscribe
+Lambda's body shape and the daily-sync's wrong list endpoint).
+
 ## Database migrations
 
 Lambdas connect to RDS as **`gls_writer`** (the `DB_USER` env var). Migrations,

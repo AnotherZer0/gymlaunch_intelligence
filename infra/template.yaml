@@ -561,6 +561,40 @@ Resources:
             Name: gymlaunch-client-pulse-summary-biweekly
             Enabled: true
 
+  # Daily SF -> RDS payment-data sync (customers/subscriptions/invoices/transactions/
+  # products into the sf_* tables from migration 014). Incremental upsert; reuses the
+  # OAuth token cache from the subscribe function.
+  SubscriptionFlowSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-subscriptionflow-daily-sync
+      CodeUri: ../src/subscriptionflow/sync/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          SF_CLIENT_ID: !Ref SfClientId
+          SF_CLIENT_SECRET: !Ref SfClientSecret
+          # DEBUG=1 = dry run (fetch a small sample per object, write NOTHING, return what
+          # it parsed). FULL_SYNC=1 ignores the watermark and backfills every object (use
+          # for the first run / a re-sync). Flip either in the console; both reset to "0"
+          # on the next deploy.
+          DEBUG: "0"
+          FULL_SYNC: "0"
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        DailySync:
+          Type: Schedule
+          Properties:
+            # 06:30 UTC — a clean gap between the other daily crons (fathom 04:00,
+            # lead_db2 07:00, supabase 08:00) and off the top-of-hour Asana jobs.
+            Schedule: cron(30 6 * * ? *)
+            Name: gymlaunch-subscriptionflow-daily-sync
+            Enabled: true
+
 Outputs:
   SlackFunctionArn:
     Value: !GetAtt SlackSyncFunction.Arn
@@ -592,6 +626,8 @@ Outputs:
     Value: !GetAtt LeadDb2SheetSyncFunction.Arn
   SfCreateGoSubFunctionArn:
     Value: !GetAtt SfCreateGoSubFunction.Arn
+  SubscriptionFlowSyncFunctionArn:
+    Value: !GetAtt SubscriptionFlowSyncFunction.Arn
     Description: "SubscriptionFlow subscribe endpoint — enable a Function URL on this function in the console."
   ClientIdentityResolverFunctionArn:
     Value: !GetAtt ClientIdentityResolverFunction.Arn

@@ -429,14 +429,26 @@ more." The current shape is deliberately minimal; several things were parked:
 
 ---
 
-## [open] SubscriptionFlow failed-payment alerting + daily data sync
+## [open] SubscriptionFlow payment-data sync → DB (billing fields + churn signal + alerting)
 
-**Captured:** 2026-06-24
+**Captured:** 2026-06-24 (direction firmed up same day)
 
 **Revisit when:** the weekend Zapier test has shown what SF actually emits on a
 failed transaction, or sooner if we decide to build the daily sync first.
 
-**Goal:** a reliable **failed-payment alert system** for SubscriptionFlow.
+**DECISION (2026-06-24): build the DB sync, don't do a direct SF→HubSpot push.**
+The immediate ask is small — push invoice `amount_due` / `amount_paid` to HubSpot
+(those don't sync natively). For *that alone* a DB would be overkill (it's a straight
+field copy, no derivation). What flips it to "build the DB" is that payment behavior
+is a **churn signal** for the "brain" ([[project_ai_brain]]): non-payment / slipping
+payments / failed-then-recovered charges predict churn. That signal is **temporal**
+— it lives in the history, and (a) HubSpot properties are last-value-wins (can't hold
+history) and (b) **transactions don't sync to HubSpot at all**, so the DB is the only
+home for the sharpest signal. Clinching argument: **history can't be backfilled** —
+every day without the sync is payment history lost forever, so start banking it now.
+
+**Goal:** reliable **failed-payment alerting** + a **payment-behavior data layer**
+that serves billing-field display now and churn scoring later.
 
 **Current interim step (user, this weekend):** SF dashboard webhook on failed
 transactions → Zapier, just to observe what real failures look like over the
@@ -455,14 +467,90 @@ organic failures.
    source of truth, and makes alert logic testable (just query `status = failed`).
    Feeds the broader unified-activity / "AI brain" data layer.
 
-**Open decisions:**
-- Schema: tables for `sf_subscription`, `sf_transaction`, `sf_invoice` (+ GRANTs to
-  `gls_writer` per the CLAUDE.md migration rule). Identity: link to `client_account`
-  via SF customer_id in `client_external_id`.
+**Consumers of the sync (build decoupled — don't block billing on the brain):**
+1. **Billing fields → HubSpot (now, simple):** daily push of invoice `amount_due` /
+   `amount_paid` (and later the rest of the billing list) read off the DB. Open
+   sub-question: do those land 1:1 on the synced HubSpot **invoice objects** (easy,
+   sidesteps identity mapping) or rolled up to **company/contact** (needs aggregation
+   + SF-customer→HubSpot mapping)? User's wording suggests 1:1 invoice enrichment.
+2. **Churn signal (later, analytical):** payment-behavior features for [[project_ai_brain]].
+3. **Failed-payment alerting:** the reconciliation backbone behind the webhook.
+
+**Scope discipline:** sync **payment objects only** (invoices + transactions, plus
+subscriptions for status/frequency). Do NOT model all of SF speculatively — that's the
+junk-drawer risk. Raw payment objects in, derived fields out.
+
+**Key design decision (the important one):** store **latest-state per invoice**
+(upsert — simple, current snapshot only) vs **capture state changes over time**
+(due→failed→paid transitions — the churn-rich part). Churn needs the transitions, so
+lean toward capturing status changes, not just overwriting the row.
+
+**Schema: DRAFTED in migration `014_subscriptionflow_data_schema.sql`** (2026-06-30) —
+5 tables `sf_customer`/`sf_subscription`/`sf_invoice`/`sf_transaction`/`sf_product`,
+TEXT PKs, flat columns + `raw jsonb` per table, denormalized `primary_subscription_id`/
+`primary_invoice_id`, no hard FKs, gls_writer grants. NOT yet applied.
+
+**RESOLVED from live API responses (2026-06-30):**
+- **Identity SOLVED:** `hubspot_id` is a real, populated field on customer/invoice/
+  subscription; subscription also has `additional_data.hubspot_deal_id`. For HubSpot-sourced
+  customers (`data_source='HubSpot'`) the SF id == hubspot_id. Deterministic join — no email
+  matching. (Nullable for SF-created customers until they sync back.)
+- **Cross-links are embedded** in detail responses: `invoice.items[].subscription_id`,
+  `invoice.transactions[]`, `transaction.invoices[].invoice_id`, `subscription.items[].plan_price`.
+  So real FK columns are populatable (not customer-key-only as first feared).
+- **Billing frequency** = derive from embedded `plan_price.billing_period_months_weeks`
+  (13 weeks = quarterly). Denormalized onto `sf_subscription.billing_frequency`. No plan table.
+- **`next_bill_date`** is a real field → billing's "Next Payment Date." `payment_status`
+  on the subscription = the "Invoice Status" rollup → billing's "Billing Status."
+- `accounting_resource_id` = Sage Intacct id; `payment_type_id` = card mask; SF has native
+  `primary_churn_score_value`/`_grade` fields (null now — maybe enable on their side).
+
+**Sync Lambda: BUILT (2026-06-30, not deployed)** — `gymlaunch-subscriptionflow-daily-sync`
+(`src/subscriptionflow/sync/handler.py`). Daily `cron(30 6 * * ? *)`, wired in
+template.yaml + deploy.sh. `DEBUG=1` = dry run (one bounded page/object, no writes, returns
+sample + pagination meta + request trace).
+
+**Dry-run findings (2026-07-01) that reshaped it:**
+- Endpoint: use **`GET /<obj>/with-relations`** (plain list works too but is thinner;
+  `POST /<obj>/filter` returns empty with no condition). Pagination is **Laravel page-based**
+  (`?page` / `meta.last_page` / `links.next`), NOT `filter[$offset]` (which SF ignores).
+- **with-relations does NOT embed items[]/invoices[]** — only flat fields + customer_id. So
+  the detail-fetch was dropped (it was an N+1 that timed out). Nested-derived columns
+  (`primary_subscription_id`, `primary_invoice_id`, `plan_id`, `billing_frequency`) are left
+  NULL for now — all billing + churn fields are flat. `raw` jsonb keeps everything.
+- **Volume: ~116k customers (582 pages), 13k transactions, 10k invoices, 1.4k subs, 30
+  products** @ ~2s/API call → a single run can't backfill. So the sync is now **resumable**:
+  per-page upsert, `sf_sync_state` cursor (**migration 015**), timeout guard (stops <60s before
+  the deadline, resumes next invocation), then incremental-by-watermark once backfilled.
+- Mappers validated on live data (billing_frequency→Quarterly, onetime→PIF; failure signal
+  visible as invoice status `Due` + note `"Payment failed[N]"`).
+
+**STILL OPEN:**
+- **Go live:** apply migrations `014` + `015`, deploy. Empty tables backfill automatically —
+  the daily 06:30 cron will chip away at the customer backfill over several days (resumable),
+  or invoke manually a few times to finish it faster. Watch each run's `stats` (`mode`,
+  `pages`, `stopped_early`, `backfill_done`).
+- **VERIFY incremental filter on the first post-backfill run.** The `filter[updated_at][$gte]`
+  param is assumed-supported but unconfirmed. If a post-backfill run shows a huge `pages`
+  count (re-pulling everything), SF isn't honoring it → switch to sort-desc + stop-at-watermark
+  or a page cursor. Per-page upsert means even the bad case is correct, just slow.
+- **~116k customers is a lot** — mostly HubSpot-synced contacts with no billing. Decide whether
+  to sync all (resumable handles it) or scope to customers with billing activity. Not blocking.
+- **Deferred nested fields** (`primary_subscription_id`/`primary_invoice_id`/`plan_id`/
+  `billing_frequency`) — enrich later via a targeted pass (subs are only ~1.4k) or from `raw`.
+- **Failed transaction status value + `decline_reason`** — success = `status="Paid"`; failure
+  value unconfirmed. Invoice-level signal (`status=Due` + note `"Payment failed[N]"`) may be
+  the better churn trigger anyway. Grab from the weekend webhook.
+- **Customer outstanding balance** — not on the customer payload; compute from invoices
+  (`SUM(closing_balance)`), handled by the downstream HubSpot-push consumer.
+- **NEXT CONSUMER — the RDS→HubSpot push is still NOT built.** This sync only fills the DB.
+  Pushing invoice amount_due/paid onto HubSpot (via invoice `hubspot_id`) is the billing-dept ask.
 - Sync endpoints: `GET /subscriptions`, plus the transaction/invoice list endpoints
   (need to confirm exact paths/filters in `docs/vendor/subscriptionflow/openapi.json`).
 - Full-load-then-incremental vs full daily pull; cadence; lookback window.
 - Alert channel + dedupe (don't re-alert the same failed txn from both webhook and
   sync).
+- RDS is `db.t4g.micro` (1 GB) — practical ~50–80 connection ceiling; this sync adds
+  ~1 connection/run (negligible). See RDS notes (CPU idle, storage trivial).
 
 ---
