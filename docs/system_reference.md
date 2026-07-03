@@ -46,6 +46,8 @@ but changing it would require tearing down and recreating all resources, so it s
 | `gymlaunch-lead_db2-sheet-sync` | Daily at 07:00 UTC (one hour before supabase-lead-sync) | `src/sync/lead_db2_sheet/` |
 | `gymlaunch-add-slack-channel` | Function URL (on-demand, HubSpot-triggered) — **manually managed, see note** | `src/slack/add_channel/` |
 | `gymlaunch-sf-create-custom-weekly-sub-for-go-product` | Function URL (on-demand) — **manually managed, see note** | `src/subscriptionflow/create_sub/` |
+| `gymlaunch-subscriptionflow-daily-sync` | Daily at 06:30 UTC | `src/subscriptionflow/sync/` |
+| `gymlaunch-sync-sf-billing-info-to-hubspot` | Daily at 06:45 UTC (right after the sync) | `src/subscriptionflow/hubspot_push/` |
 | `gymlaunch-client-identity-resolver` | Once daily | `src/identity/resolver/` |
 | `gymlaunch-client-pulse-summary` | Every 14 days | `src/pulse/summary/` |
 
@@ -139,6 +141,9 @@ The Google service account JSON is base64-encoded by deploy.sh and passed as
 | `db/migrations/012_hubspot_coach_sync.sql` | Adds `hs_coach` column to `asana_agency_board_task` for HubSpot→Asana coach sync |
 | `db/migrations/013_subscriptionflow_schema.sql` | `subscriptionflow_oauth_token` table (singleton OAuth2 token cache) |
 | `db/migrations/014_client_period_summary.sql` | `client_period_summary` table + `client_account.active` flag; asserts `gls_writer` grants on the identity tables (`client_account`, `client_external_id`) now that the resolver writes them |
+| `db/migrations/015_subscriptionflow_data_schema.sql` | SF data lake: `sf_customer`, `sf_subscription`, `sf_invoice`, `sf_transaction`, `sf_product` (was numbered 014 — renumbered to avoid the collision with `014_client_period_summary`) |
+| `db/migrations/016_subscriptionflow_sync_state.sql` | `sf_sync_state` — per-object sync cursor (resumable backfill + incremental watermark) |
+| `db/migrations/017_subscriptionflow_hubspot_push_state.sql` | `sf_hubspot_push_state` — per-company md5 hash for the HubSpot billing-push change detection |
 
 ### Key Tables
 
@@ -762,27 +767,41 @@ See `src/fathom/webhook/how_to_query.txt` for full query reference.
 
 ## SubscriptionFlow
 
-**Lambda:** `gymlaunch-sf-create-custom-weekly-sub-for-go-product`
-**Trigger:** Function URL (on-demand) — **manually managed** (deploy user can't create Function URLs)
-**Source:** `src/subscriptionflow/create_sub/`
-**Secret:** `gymlaunch/subscriptionflow/api` — JSON with keys `client_id`, `client_secret`, `endpoint_api_key`
+Three independent Lambdas. **Full narrative: `docs/subscriptionflow_explained.md`.**
+**Secret (shared):** `gymlaunch/subscriptionflow/api` — JSON `client_id`, `client_secret`, `endpoint_api_key`.
+**Auth (shared):** OAuth2 client-credentials; bearer token cached in `subscriptionflow_oauth_token`
+(singleton, migration 013) and rotated in-band (proactive on expiry, reactive on 401).
 
-Creates a 1-year Termed (fixed-term, ends after 1 year) weekly subscription for the GO product in
-SubscriptionFlow. Accepts a JSON POST with `id` (SF customer ID) or `email`, plus optional `price`.
-Auth: `x-api-key` header or `?key=` query param matching `endpoint_api_key`.
+**Tables:** `subscriptionflow_oauth_token` (013); `sf_customer`/`sf_subscription`/`sf_invoice`/
+`sf_transaction`/`sf_product` (015, the data lake — TEXT PKs, `raw jsonb`, no hard FKs);
+`sf_sync_state` (016, sync cursor); `sf_hubspot_push_state` (017, push change-detection hashes).
 
-SubscriptionFlow uses OAuth2 client-credentials. The bearer token is cached in `subscriptionflow_oauth_token`
-(singleton, migration 013) and rotated in-band — proactively on expiry, reactively on 401.
+### 1. `gymlaunch-sf-create-custom-weekly-sub-for-go-product` — subscribe endpoint
+`src/subscriptionflow/create_sub/` · Function URL (on-demand) — **manually managed** (deploy user
+can't create Function URLs). Auth: `x-api-key` header or `?key=` matching `endpoint_api_key`.
+Finds/creates the SF customer, then creates a **1-year Termed** sub (`is_auto_renew:0` → ends after
+a year). `pay_invoice` OFF (invoice left DUE). `price` defaults to 0.00. Weekly cadence comes from the
+SF plan config, NOT the payload. `DEBUG=1` = read-only dry run returning the body it would post.
 
-`pay_invoice` is OFF — invoice is left in DUE state so SF doesn't auto-charge. Price defaults to 0.00
-when omitted (intentional — fix after the fact as needed). Weekly cadence comes from the SF plan config,
-NOT the payload — confirm plan `f359c92d-...` is configured as a weekly plan in the SF dashboard.
+### 2. `gymlaunch-subscriptionflow-daily-sync` — SF → RDS
+`src/subscriptionflow/sync/` · `cron(30 6 * * ? *)` (06:30 UTC). Mirrors 5 SF objects into the `sf_*`
+tables. **Backfill** = `GET /<obj>/with-relations` (page-based); **incremental** = `POST /<obj>/filter`
+with `filter[updated_at][$gte]` (the plain list IGNORES that filter — hence /filter). Per-page upsert,
+**resumable** via `sf_sync_state` (checkpoints `backfill_next_page`, stops ~60s before deadline), then
+incremental once `backfill_done`. `DEBUG=1` = one-page sample dry run; `FULL_SYNC=1` = force re-backfill
+(one run then off). Nested fields (`primary_*_id`, `plan_id`, `billing_frequency`) are NULL — deferred
+(with-relations omits `items[]`); `raw jsonb` has everything. Monitor: `SELECT * FROM sf_sync_state`.
 
-**DEBUG dry-run:** set env var `DEBUG=1` in the Lambda console to make it authenticate + look up the
-customer READ-ONLY and return the subscription body it WOULD post. Resets to "0" on next deploy.
+### 3. `gymlaunch-sync-sf-billing-info-to-hubspot` — RDS → HubSpot company fields
+`src/subscriptionflow/hubspot_push/` · `cron(45 6 * * ? *)` (06:45 UTC, after the sync). One SQL rollup
+computes 6 company properties per `sf_customer.hubspot_id`, batch-updates HubSpot **companies** (100/call),
+pushing only CHANGED companies (md5 vs `sf_hubspot_push_state`). Billing-active companies only; non-numeric
+hubspot_ids skipped. Properties: `billing_status` (dropdown Current/Past Due/Cancelled/Pending),
+`outstanding_balance`, `current_billing_amount`, `billing_frequency`, `last_payment_date`, `next_payment_date`.
+Product/frequency are Path A text-parse (product_id not synced). `DEBUG=1` = compute + sample, no writes.
 
-**Watch-outs:** see `docs/future_work.md` SubscriptionFlow entry for known gaps (price hardening,
-plan registry, renewal_type field confirmed only as `"Renew with Specific Term"`).
+**Watch-outs / known gaps:** `docs/future_work.md` (price hardening, plan registry, `billing_frequency`
+blank for prepaid-annual, real product categorization, churn scoring, failed-payment alerting).
 
 ---
 

@@ -154,6 +154,7 @@ set_retention /aws/lambda/gymlaunch-supabase-lead-sync
 set_retention /aws/lambda/gymlaunch-lead_db2-sheet-sync
 set_retention /aws/lambda/gymlaunch-sf-create-custom-weekly-sub-for-go-product
 set_retention /aws/lambda/gymlaunch-subscriptionflow-daily-sync
+set_retention /aws/lambda/gymlaunch-sync-sf-billing-info-to-hubspot
 set_retention /aws/lambda/gymlaunch-fathom-daily-sync
 set_retention /aws/lambda/gymlaunch-client-identity-resolver
 set_retention /aws/lambda/gymlaunch-client-pulse-summary

@@ -5,6 +5,15 @@
 Always ask the user what to name the Lambda function before writing any code.
 Do not invent or reuse a name without explicit confirmation.
 
+**The name MUST start with `gymlaunch-` and use hyphens — never underscores.** The
+`gymlaunch-deploy` IAM policy scopes Lambda actions to the ARN pattern `gymlaunch-*`
+(literal hyphen), so an underscore name like `gymlaunch_foo` deploys with `AccessDenied`
+on `lambda:GetFunction` and CloudFormation rolls the whole stack back. If the user
+proposes underscores or a different prefix, flag it and convert to
+`gymlaunch-...-with-hyphens` before writing any code. (First hit: the SF billing push,
+named `gymlaunch_sync_...`, failed its deploy this way — renamed to
+`gymlaunch-sync-sf-billing-info-to-hubspot`.)
+
 ## Debug / dry-run mode
 
 Every Lambda or job we build that performs writes or outward side-effects (external

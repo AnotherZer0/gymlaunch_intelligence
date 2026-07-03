@@ -2,8 +2,8 @@
 gymlaunch-subscriptionflow-daily-sync — daily SF -> RDS payment-data sync.
 
 Mirrors SubscriptionFlow ("SF") customers, subscriptions, invoices, transactions,
-and products into the `sf_*` tables (migration 014), tracking progress in
-`sf_sync_state` (migration 015). Feeds the billing-field push to HubSpot, the churn
+and products into the `sf_*` tables (migration 015), tracking progress in
+`sf_sync_state` (migration 016). Feeds the billing-field push to HubSpot, the churn
 signal, and the failed-payment alerting backbone.
 
 METHOD (see docs/future_work.md for the design discussion)
@@ -415,15 +415,32 @@ def upsert(conn, table, rows):
     return len(rows)
 
 
-def fetch_page(conn, token_box, obj, page, per_page, watermark=None):
-    """One page of GET /<obj>/with-relations -> (mapped rows, meta, links, raw count)."""
-    params = {"page": page, "per_page": per_page}
-    if watermark:
-        params["filter[updated_at][$gte]"] = (watermark - LOOKBACK).isoformat()
-    payload = sf_request(conn, token_box, "GET", f"/{obj['path']}/with-relations", params=params)
+def fetch_page(conn, token_box, obj, page, per_page):
+    """One BACKFILL page of GET /<obj>/with-relations -> (mapped rows, meta, links, count)."""
+    payload = sf_request(conn, token_box, "GET", f"/{obj['path']}/with-relations",
+                         params={"page": page, "per_page": per_page})
     records = payload.get("data") or []
     rows = [obj["map"](normalize(r)) for r in records]
     return rows, (payload.get("meta") or {}), (payload.get("links") or {}), len(records)
+
+
+def fetch_incremental_page(conn, token_box, obj, offset, per_page, watermark):
+    """
+    One INCREMENTAL page via POST /<obj>/filter with an updated_at condition.
+
+    The plain list / with-relations endpoints IGNORE filter[updated_at] (they re-return
+    everything), so incremental uses /filter — SF's conditional-query endpoint, which is
+    built to honor filter[column][$gte] and paginates with filter[$limit]/[$offset].
+    """
+    params = {
+        "filter[$limit]": per_page,
+        "filter[$offset]": offset,
+        "filter[updated_at][$gte]": (watermark - LOOKBACK).isoformat(),
+    }
+    payload = sf_request(conn, token_box, "POST", f"/{obj['path']}/filter", params=params)
+    records = payload.get("data") or []
+    rows = [obj["map"](normalize(r)) for r in records]
+    return rows, len(records)
 
 
 def sample_object(conn, token_box, obj, stats):
@@ -473,18 +490,20 @@ def process_object(conn, token_box, obj, context, stats):
         return
 
     stats["mode"] = "incremental"
-    wm = st["last_watermark"]
-    page = 1
+    wm = st["last_watermark"] or table_watermark(conn, obj["table"])
+    if wm is None:
+        return   # nothing synced yet, nothing to filter from
+    offset = 0
     while True:
         if time_left_ms(context) < SAFETY_MS:
             stats["stopped_early"] = True
             break
-        rows, meta, links, page_count = fetch_page(conn, token_box, obj, page, PAGE_SIZE, watermark=wm)
+        rows, count = fetch_incremental_page(conn, token_box, obj, offset, PAGE_SIZE, wm)
         stats["upserted"] += upsert(conn, obj["table"], rows)
         stats["pages"] = stats.get("pages", 0) + 1
-        if _last_page(page, meta, links, page_count):
+        if count < PAGE_SIZE:
             break
-        page += 1
+        offset += PAGE_SIZE
     write_state(conn, obj["key"], last_watermark=(table_watermark(conn, obj["table"]) or wm))
 
 

@@ -13,7 +13,7 @@
 --
 -- One row per SF object type ('customer','subscription','invoice','transaction','product').
 --
--- Depends on: 014_subscriptionflow_data_schema.sql
+-- Depends on: 015_subscriptionflow_data_schema.sql
 
 BEGIN;
 

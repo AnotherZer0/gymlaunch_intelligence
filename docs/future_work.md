@@ -429,7 +429,16 @@ more." The current shape is deliberately minimal; several things were parked:
 
 ---
 
-## [open] SubscriptionFlow payment-data sync → DB (billing fields + churn signal + alerting)
+## [done] SubscriptionFlow payment-data sync → DB + billing push to HubSpot (churn/alerting still open)
+
+**STATUS (2026-07-03): LIVE + hands-off.** The SF→RDS sync (`gymlaunch-subscriptionflow-daily-sync`,
+06:30 UTC) and the RDS→HubSpot billing push (`gymlaunch-sync-sf-billing-info-to-hubspot`, 06:45 UTC)
+are both deployed and running daily. Backfill complete; incremental verified lean. See
+`docs/subscriptionflow_explained.md` for the full how-it-works. **Migrations renumbered** 014→015,
+015→016, 016→017 (the original 014 collided with the AI-brain `014_client_period_summary.sql`).
+**Still open (follow-ons, NOT built):** churn scoring on the payment history; the failed-payment
+alerting Lambda (webhook→Zapier is the current stopgap); Path B product/plan categorization to fix
+the deferred nested fields (`billing_frequency` blank for prepaid-annual, real `product_id`).
 
 **Captured:** 2026-06-24 (direction firmed up same day)
 
@@ -485,7 +494,8 @@ junk-drawer risk. Raw payment objects in, derived fields out.
 (due→failed→paid transitions — the churn-rich part). Churn needs the transitions, so
 lean toward capturing status changes, not just overwriting the row.
 
-**Schema: DRAFTED in migration `014_subscriptionflow_data_schema.sql`** (2026-06-30) —
+**Schema: migration `015_subscriptionflow_data_schema.sql`** (renumbered from 014 — collided
+with the AI-brain `014_client_period_summary.sql`; see note at entry end) —
 5 tables `sf_customer`/`sf_subscription`/`sf_invoice`/`sf_transaction`/`sf_product`,
 TEXT PKs, flat columns + `raw jsonb` per table, denormalized `primary_subscription_id`/
 `primary_invoice_id`, no hard FKs, gls_writer grants. NOT yet applied.
@@ -520,20 +530,25 @@ sample + pagination meta + request trace).
   NULL for now — all billing + churn fields are flat. `raw` jsonb keeps everything.
 - **Volume: ~116k customers (582 pages), 13k transactions, 10k invoices, 1.4k subs, 30
   products** @ ~2s/API call → a single run can't backfill. So the sync is now **resumable**:
-  per-page upsert, `sf_sync_state` cursor (**migration 015**), timeout guard (stops <60s before
+  per-page upsert, `sf_sync_state` cursor (**migration 016**), timeout guard (stops <60s before
   the deadline, resumes next invocation), then incremental-by-watermark once backfilled.
 - Mappers validated on live data (billing_frequency→Quarterly, onetime→PIF; failure signal
   visible as invoice status `Due` + note `"Payment failed[N]"`).
 
 **STILL OPEN:**
-- **Go live:** apply migrations `014` + `015`, deploy. Empty tables backfill automatically —
+- **Go live:** apply migrations `015` + `016`, deploy. Empty tables backfill automatically —
   the daily 06:30 cron will chip away at the customer backfill over several days (resumable),
   or invoke manually a few times to finish it faster. Watch each run's `stats` (`mode`,
   `pages`, `stopped_early`, `backfill_done`).
-- **VERIFY incremental filter on the first post-backfill run.** The `filter[updated_at][$gte]`
-  param is assumed-supported but unconfirmed. If a post-backfill run shows a huge `pages`
-  count (re-pulling everything), SF isn't honoring it → switch to sort-desc + stop-at-watermark
-  or a page cursor. Per-page upsert means even the bad case is correct, just slow.
+- **Backfill COMPLETE (2026-07-01)** — all 5 tables loaded: ~116k customers, 13,169 txns,
+  9,740 invoices, 1,385 subs, 30 products. Resumable backfill worked (customers over ~4 runs).
+- **Incremental filter: the plain list/with-relations endpoints IGNORE `filter[updated_at][$gte]`**
+  (confirmed — a post-backfill run re-pulled ALL rows in `incremental` mode). FIX applied:
+  incremental now uses **`POST /<obj>/filter`** (SF's conditional-query endpoint, offset-paginated,
+  built to honor `filter[column][$gte]`); backfill stays on `/with-relations`. **VERIFIED
+  2026-07-01: works** — a post-backfill run was all `incremental`, `pages: 1`, delta-only
+  (product 4, customer 4 changed; rest 0), whole run **10 seconds**. Sync is LIVE + hands-off;
+  the 06:30 UTC cron owns it.
 - **~116k customers is a lot** — mostly HubSpot-synced contacts with no billing. Decide whether
   to sync all (resumable handles it) or scope to customers with billing activity. Not blocking.
 - **Deferred nested fields** (`primary_subscription_id`/`primary_invoice_id`/`plan_id`/
@@ -543,8 +558,26 @@ sample + pagination meta + request trace).
   the better churn trigger anyway. Grab from the weekend webhook.
 - **Customer outstanding balance** — not on the customer payload; compute from invoices
   (`SUM(closing_balance)`), handled by the downstream HubSpot-push consumer.
-- **NEXT CONSUMER — the RDS→HubSpot push is still NOT built.** This sync only fills the DB.
-  Pushing invoice amount_due/paid onto HubSpot (via invoice `hubspot_id`) is the billing-dept ask.
+- **RDS→HubSpot billing push: BUILT (2026-07-01, not deployed)** — `gymlaunch-sync-sf-billing-info-to-hubspot`
+  (`src/subscriptionflow/hubspot_push/handler.py`), daily `cron(45 6 * * ? *)` after the sync.
+  Computes 6 company fields per `sf_customer.hubspot_id` (billing_status, outstanding_balance,
+  current_billing_amount, billing_frequency, last_payment_date, next_payment_date) via one SQL
+  rollup; batch-updates HubSpot **companies** (100/call); pushes only CHANGED companies
+  (md5 hash vs `sf_hubspot_push_state`, **migration 017**). Billing-active companies only; junk
+  (non-numeric) hubspot_ids skipped. Product/frequency = Path A text-parse from invoice
+  `description`/name. `DEBUG=1` dry-run. HubSpot company properties must exist:
+  `billing_status` (dropdown Current/Past Due/Cancelled/Pending), `outstanding_balance` +
+  `current_billing_amount` (number/currency), `billing_frequency` (string), `last_payment_date`
+  + `next_payment_date` (date). **Go-live:** apply migration `017` → deploy → `DEBUG=1` dry-run
+  to eyeball computed values + changed-count (the SQL is untested against real data) → then live.
+  Watch-out: verify the `excluded` product-name subquery actually excludes Additional Programs/
+  Testing (0 exclusions if names don't resolve); HubSpot 207s captured in the response `errors`.
+  DEBUG dry-run 2026-07-03 looked good (613 companies, statuses/amounts/dates sane, Quarterly
+  parsed right). **Known limitation:** `billing_frequency` is blank for **prepaid-annual termed
+  subs** (e.g. paid $20,997 up front) — the cadence lives in `plan_price.billing_period` (not
+  synced) and the flat term fields can't distinguish "billed weekly over a year" from "prepaid
+  the year at once"; true one-off products are still caught as PIF via `is_oneoff`. Real fix =
+  Path B (detail-enrich subs for `plan_price`), same project as real product categorization.
 - Sync endpoints: `GET /subscriptions`, plus the transaction/invoice list endpoints
   (need to confirm exact paths/filters in `docs/vendor/subscriptionflow/openapi.json`).
 - Full-load-then-incremental vs full daily pull; cadence; lookback window.

@@ -595,6 +595,35 @@ Resources:
             Name: gymlaunch-subscriptionflow-daily-sync
             Enabled: true
 
+  # Pushes computed SF billing fields onto HubSpot companies. Runs right after the
+  # 06:30 sync. Only writes companies whose values changed (sf_hubspot_push_state), so
+  # daily API load is tiny. Reuses HubspotToken; needs VPC for RDS + HubSpot egress.
+  SfBillingToHubspotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: gymlaunch-sync-sf-billing-info-to-hubspot
+      CodeUri: ../src/subscriptionflow/hubspot_push/
+      Handler: handler.lambda_handler
+      Role: !GetAtt SlackSyncRole.Arn
+      Environment:
+        Variables:
+          HUBSPOT_TOKEN: !Ref HubspotToken
+          # DEBUG=1 = dry run: compute + report a sample and the changed-count, write
+          # NOTHING to HubSpot and touch no state. Resets to "0" on deploy.
+          DEBUG: "0"
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DbSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Events:
+        DailyPush:
+          Type: Schedule
+          Properties:
+            # 06:45 UTC — right after the 06:30 SF->RDS sync, so HubSpot gets fresh data.
+            Schedule: cron(45 6 * * ? *)
+            Name: gymlaunch-sf-billing-to-hubspot-daily
+            Enabled: true
+
 Outputs:
   SlackFunctionArn:
     Value: !GetAtt SlackSyncFunction.Arn
@@ -628,6 +657,8 @@ Outputs:
     Value: !GetAtt SfCreateGoSubFunction.Arn
   SubscriptionFlowSyncFunctionArn:
     Value: !GetAtt SubscriptionFlowSyncFunction.Arn
+  SfBillingToHubspotFunctionArn:
+    Value: !GetAtt SfBillingToHubspotFunction.Arn
     Description: "SubscriptionFlow subscribe endpoint — enable a Function URL on this function in the console."
   ClientIdentityResolverFunctionArn:
     Value: !GetAtt ClientIdentityResolverFunction.Arn
