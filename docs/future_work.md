@@ -587,3 +587,58 @@ sample + pagination meta + request trace).
   ~1 connection/run (negligible). See RDS notes (CPU idle, storage trivial).
 
 ---
+
+## [open] Scope-outage collateral check — read-dependent HubSpot Lambdas
+
+**Captured:** 2026-07-15
+
+Between ~2026-06-29 and 2026-07-15 the shared HubSpot private-app token had ALL
+read scopes stripped (someone edited the app; writes kept working). Restored
+2026-07-15 during the agency-board sync repair. During the gap, every Lambda
+that READS from HubSpot was silently failing:
+
+- `gymlaunch-sync-hubspot-to-agency-board` (coach sync — companies batch/read)
+- `gymlaunch-project-note-sync` (notes search) — **has only a 96h lookback**,
+  so notes created/attached during the multi-week gap were likely never synced
+- `gymlaunch-client-identity-resolver` (companies batch/read + properties)
+- `gymlaunch-sms-interceptor`'s HubSpot logging (contact search) — SMS
+  forwarding itself was unaffected
+
+**Why deferred:** the main session focused on repairing the agency-board sync;
+these should self-recover going forward now that scopes are back.
+
+**Revisit when:** next session touching any of these. To close: confirm each
+ran clean since 2026-07-15 (their state tables / run statuses), and decide
+whether the project-note sync needs a one-off widened-lookback backfill run
+(it supports a lookback override — see system_reference.md) to cover the gap.
+Also worth asking HubSpot admins what changed the app's scopes, so it doesn't
+happen again.
+
+---
+
+## [open] Agency board — 6 parked dead HubSpot company ids
+
+**Captured:** 2026-07-15
+
+Six Asana tasks carry HubSpot Company IDs that don't exist (deleted/merged
+companies, or wrong values). Their rows are PARKED by the sync — recorded as
+`ERROR (parked until Asana edit)` in `asana_agency_board_task`, not retried,
+never alerted (deliberate: procedural fix, owner = ops, not code):
+
+| Gym | Client | AM | Bad id |
+|---|---|---|---|
+| Alch3my Fitness Group | Leslie Boyce | Henry | 162811470611 |
+| Grit Strength Gym | Mike Gritti | Henry | 59321395 |
+| Misfits Fitness - New | Josh Wilson | Suly | 43776308 (portal id!) |
+| Precision Motion | Preston Daniel | Suly | 227264275316 |
+| CORE Wellness | Tisha Kelly | Henry | 210431883335 |
+| Movement Athletics | Pedro Torres | Bailey | 219915406731 |
+
+**Why deferred:** user classified as a procedural issue for the AMs to fix in
+Asana. Fixing the ID on the Asana task changes the row's content_hash, which
+un-parks it automatically — no code or ops action needed on our side.
+
+**Revisit when:** checking sync health — `SELECT ... WHERE
+last_hubspot_run_status LIKE 'ERROR (parked%'` shows whatever is still unfixed.
+
+---

@@ -14,6 +14,14 @@ proposes underscores or a different prefix, flag it and convert to
 named `gymlaunch_sync_...`, failed its deploy this way — renamed to
 `gymlaunch-sync-sf-billing-info-to-hubspot`.)
 
+## Deploys are the user's job
+
+Never run `bash scripts/deploy.sh`, `sam deploy`, `aws lambda update-function-configuration`,
+or anything else that changes deployed infrastructure — the user always deploys themselves.
+Write the code, verify it compiles, then hand off with "ready for you to deploy." The same
+applies to invoking Lambdas and toggling env flags in the console unless the user
+explicitly asks for it.
+
 ## Debug / dry-run mode
 
 Every Lambda or job we build that performs writes or outward side-effects (external

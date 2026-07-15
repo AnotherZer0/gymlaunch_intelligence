@@ -144,6 +144,7 @@ The Google service account JSON is base64-encoded by deploy.sh and passed as
 | `db/migrations/015_subscriptionflow_data_schema.sql` | SF data lake: `sf_customer`, `sf_subscription`, `sf_invoice`, `sf_transaction`, `sf_product` (was numbered 014 — renumbered to avoid the collision with `014_client_period_summary`) |
 | `db/migrations/016_subscriptionflow_sync_state.sql` | `sf_sync_state` — per-object sync cursor (resumable backfill + incremental watermark) |
 | `db/migrations/017_subscriptionflow_hubspot_push_state.sql` | `sf_hubspot_push_state` — per-company md5 hash for the HubSpot billing-push change detection |
+| `db/migrations/018_hubspot_sync_alert_state.sql` | `hubspot_sync_alert_state` — singleton fingerprint of the agency-board sync's actionable failures, drives change-only alert emails |
 
 ### Key Tables
 
@@ -230,11 +231,44 @@ How to add new Asana custom fields: `src/sync/asana/agency_board/how_to_update.t
 
 ## HubSpot
 
-- `gymlaunch-hubspot-sync` — runs at :10 past every hour
+- `gymlaunch-sync-agency-board-to-hubspot` — runs at :10 past every hour
 - Reads rows from `asana_agency_board_task` where `content_hash != last_synced_hash`
 - Pushes changes to HubSpot via Batch Companies API (`/crm/v3/objects/companies/batch/update`)
 - Special case: when `coach = "Agency Pro"`, clears the field via a separate PATCH
-- Account manager mapping via `account_manager_hubspot_map` table
+- Account manager mapping via `account_manager_hubspot_map` table — **every AM name
+  on the Asana board must have a row here** (exact spelling); unmapped AMs sync
+  without the owner field and HubSpot silently keeps the stale owner
+- `DEBUG` env var (default `"0"`): dry-run mode — no HubSpot/DB writes, returns the
+  would-send payload in the response. While `1`, the hourly runs are no-ops.
+
+### Failure handling (added July 2026 after a month-long silent jam)
+
+HubSpot's batch update is **atomic on validation errors** — one bad record 400s the
+whole batch. The June 2026 outage: a new Asana status ("Onboard - Stalled") wasn't an
+option on the HubSpot `asana_agency_status` dropdown, so every batch failed hourly for
+a month. The sync now:
+
+- **Falls back to per-record PATCHes** when a batch fails, so one poison record can't
+  block the rest.
+- **Stores HubSpot's real error** in `last_hubspot_run_status` (e.g. the INVALID_OPTION
+  message naming the bad value) — diagnosable from the DB, no CloudWatch needed.
+- **Normalizes company ids**: a pasted record URL (`.../record/0-2/<id>`) is reduced to
+  the numeric id before sending.
+- **Parks 404s** (deleted/nonexistent company ids): records the error but sets
+  `last_synced_hash` so the row stops retrying hourly; editing the task in Asana
+  changes the hash and un-parks it automatically. 400 validation errors keep retrying
+  because their fix is usually HubSpot-side (e.g. adding a dropdown option).
+- **Handles duplicate company ids** (two Asana tasks → one company): sends are deduped,
+  but every task row gets its status written back.
+- New-value checklist: adding a status option in Asana requires adding the same option
+  to the HubSpot `asana_agency_status` property (watch for trailing whitespace in the
+  Asana option name — values are trimmed before sending).
+- **Alerting**: actionable failures (a value HubSpot rejects, or an AM missing from
+  `account_manager_hubspot_map`) trigger an SES email to `ALERT_TO_ADDRESS`
+  (template param `HubspotSyncAlertTo`, default daniel.tingle@gymlaunchsecrets.com).
+  Parked 404s are excluded — dead ids are procedural fixes in Asana. Fires only when
+  the problem set *changes* (fingerprint in `hubspot_sync_alert_state`, migration 018),
+  so an unfixed problem doesn't email hourly; a failed send retries next run.
 
 How to add new HubSpot fields: `src/sync/hubspot/how_to_update.txt`
 

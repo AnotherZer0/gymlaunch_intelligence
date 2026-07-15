@@ -60,9 +60,15 @@ If it is informational-only and doesn't need to drive HubSpot updates,
 you can skip this.
 
 
-STEP 6 — Deploy
----------------
+STEP 6 — Deploy and verify with a dry run
+------------------------------------------
     bash scripts/deploy.sh
+
+Then set the DEBUG env var to "1" on gymlaunch-sync-agency-board-to-hubspot
+in the Lambda console and invoke it — the response shows exactly what it
+WOULD send to HubSpot (no writes happen anywhere). Flip DEBUG back to "0"
+when done (a redeploy also resets it). While DEBUG is "1" the hourly runs
+are no-ops, so don't leave it on.
 
 
 NOTES
@@ -72,20 +78,89 @@ NOTES
 - HubSpot number properties should be plain numbers, not strings.
 - None values are automatically stripped before sending to HubSpot —
   you do not need to handle nulls manually.
+- String values are trimmed before sending — HubSpot rejects dropdown
+  values with leading/trailing whitespace.
 - To find the internal name of any HubSpot property:
   HubSpot → Settings → Data Management → Properties → search for it →
   click it → "Internal name" shown below the label field.
 
 
+DROPDOWN (ENUMERATION) FIELDS — READ THIS BEFORE ADDING STATUS OPTIONS
+-----------------------------------------------------------------------
+If the HubSpot property is a dropdown, every value that can come from Asana
+MUST exist as an option on the HubSpot property. A value HubSpot doesn't
+know is a validation error.
+
+This is what broke the sync for a month in June 2026: someone added an
+"Onboard - Stalled" status in Asana with no matching HubSpot option, and
+because HubSpot's batch API rejects the ENTIRE batch when one record is
+invalid, every client's sync failed hourly until it was found.
+
+The sync now survives this (failed batches fall back to per-record updates,
+so only the bad records fail), but the bad records themselves still won't
+sync until the option is added. So:
+
+    Adding a status option in Asana?  →  Add the same option (exact
+    spelling, no trailing spaces) to the HubSpot property first.
+
+You'll get an alert email (see ALERTING below) if this is missed.
+
+
+CHECKING SYNC HEALTH
+---------------------
+Every row's outcome is in the DB — no CloudWatch needed:
+
+    SELECT last_hubspot_run_status, count(*)
+    FROM asana_agency_board_task
+    WHERE hubspot_company_id IS NOT NULL
+    GROUP BY 1 ORDER BY 2 DESC;
+
+- 'success' — synced.
+- 'ERROR: HTTP 400 ...' — HubSpot rejected the value; the message names it.
+  Retries every hour, heals itself once the cause is fixed.
+- 'ERROR (parked until Asana edit): HTTP 404 ...' — the HubSpot Company ID
+  on the Asana task is wrong or the company was deleted. The row stops
+  retrying; fixing the ID in Asana automatically un-parks it. (A pasted
+  HubSpot URL in the ID field is auto-recovered — the numeric id is
+  extracted before sending.)
+
+
+ALERTING
+---------
+The sync emails ALERT_TO_ADDRESS (template param HubspotSyncAlertTo,
+default daniel.tingle@gymlaunchsecrets.com) when it hits problems a human
+must fix: a value HubSpot rejects, or an AM missing from the map. Parked
+404s (bad company ids) never alert — those are procedural fixes in Asana.
+One email when the problem set changes, then silence (state in
+hubspot_sync_alert_state, migration 018).
+
+To test delivery end to end:
+
+    aws lambda invoke \
+      --function-name gymlaunch-sync-agency-board-to-hubspot \
+      --payload '{"test_alert": true}' \
+      --cli-binary-format raw-in-base64-out out.json
+
+Sends a clearly-marked sample email; touches nothing else.
+
+
 MANAGING ACCOUNT MANAGERS
 --------------------------
 The account_manager field is looked up in the account_manager_hubspot_map
-table — it maps the Asana display name to a HubSpot owner/user ID.
+table — it maps the Asana display name to a HubSpot owner/user ID. The name
+must match the Asana board's spelling exactly.
 
-To add a new AM:
+To add a new AM (BOTH statements matter):
 
     INSERT INTO account_manager_hubspot_map (name, hubspot_id)
     VALUES ('New Person', 'their-hubspot-id');
+
+    -- Force their companies to re-push. Without this, rows that already
+    -- synced without an owner are considered done and HubSpot silently
+    -- keeps the previous AM until the task next changes in Asana:
+    UPDATE asana_agency_board_task
+    SET last_synced_hash = NULL
+    WHERE account_manager = 'New Person';
 
 To update an existing AM's HubSpot ID:
 
@@ -93,5 +168,10 @@ To update an existing AM's HubSpot ID:
     SET hubspot_id = 'new-id', updated_at = now()
     WHERE name = 'Person Name';
 
+    UPDATE asana_agency_board_task
+    SET last_synced_hash = NULL
+    WHERE account_manager = 'Person Name';
+
 The HubSpot owner ID can be found in HubSpot under:
     Settings → Users & Teams → click the user → the ID is in the URL.
+An unmapped AM triggers the alert email described above.

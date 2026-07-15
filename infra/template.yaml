@@ -51,6 +51,10 @@ Parameters:
     Type: String
   SesToAddress:
     Type: String
+  HubspotSyncAlertTo:
+    Type: String
+    Default: daniel.tingle@gymlaunchsecrets.com
+    Description: "Recipient for agency-board->HubSpot sync actionable-failure alerts."
   SupabaseUrl:
     Type: String
     Description: "Supabase project URL (e.g. https://<ref>.supabase.co). Not secret."
@@ -166,6 +170,13 @@ Resources:
       Environment:
         Variables:
           HUBSPOT_TOKEN: !Ref HubspotToken
+          # Dry-run: "1" = no HubSpot writes / DB write-backs, returns what it
+          # would send. Toggle in console; redeploys reset it to off.
+          DEBUG: "0"
+          # Actionable-failure alert email (unknown dropdown option / unmapped AM).
+          # Fires only when the problem set changes — state in hubspot_sync_alert_state.
+          SES_FROM_ADDRESS: !Ref SesFromAddress
+          ALERT_TO_ADDRESS: !Ref HubspotSyncAlertTo
       VpcConfig:
         SecurityGroupIds:
           - !Ref DbSecurityGroupId
