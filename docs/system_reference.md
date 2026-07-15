@@ -782,6 +782,9 @@ can't create Function URLs). Auth: `x-api-key` header or `?key=` matching `endpo
 Finds/creates the SF customer, then creates a **1-year Termed** sub (`is_auto_renew:0` → ends after
 a year). `pay_invoice` OFF (invoice left DUE). `price` defaults to 0.00. Weekly cadence comes from the
 SF plan config, NOT the payload. `DEBUG=1` = read-only dry run returning the body it would post.
+**Triggered by:** the "agreements" workflow → PandaDoc agreement (template `eqaZLY8q6WWBoKiXrXtPcZ`)
+→ on signing, **Zapier zap** `https://zapier.com/editor/369877019/published` calls this Function URL.
+Edit that Zap to change what's sent.
 
 ### 2. `gymlaunch-subscriptionflow-daily-sync` — SF → RDS
 `src/subscriptionflow/sync/` · `cron(30 6 * * ? *)` (06:30 UTC). Mirrors 5 SF objects into the `sf_*`

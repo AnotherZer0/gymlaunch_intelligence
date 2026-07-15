@@ -57,6 +57,12 @@ Takes a JSON POST (`id` or `email`, optional `price`/dates/product ids) and:
 2. creates a **1-year Termed** subscription (`type: "Termed"`, `termed_initial_period: 1 year`,
    `renewal_type: "Renew with Specific Term"`, `is_auto_renew: 0` → it ends after a year).
 
+**Who calls it (the trigger chain):** an **"agreements" workflow** creates a PandaDoc agreement
+(template id `eqaZLY8q6WWBoKiXrXtPcZ`). When the customer **signs** that PandaDoc, a **Zapier zap**
+(editor: `https://zapier.com/editor/369877019/published`) fires the request at this Function URL.
+So if you need to change what's sent to the subscribe endpoint (fields, price, product), **edit that
+Zap** — not this Lambda.
+
 Key behaviors:
 - **`pay_invoice` is OFF** — the invoice is left DUE so SF doesn't auto-charge or fire
   payment-success logic.
