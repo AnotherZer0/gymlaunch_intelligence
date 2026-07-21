@@ -55,6 +55,10 @@ Parameters:
     Type: String
     Default: daniel.tingle@gymlaunchsecrets.com
     Description: "Recipient for agency-board->HubSpot sync actionable-failure alerts."
+  SmsInterceptorAlertTo:
+    Type: String
+    Default: daniel.tingle@gymlaunchsecrets.com
+    Description: "Recipient for SMS interceptor HubSpot-update failure alerts."
   SupabaseUrl:
     Type: String
     Description: "Supabase project URL (e.g. https://<ref>.supabase.co). Not secret."
@@ -287,6 +291,11 @@ Resources:
           HUBSPOT_TOKEN: !Ref HubspotToken
           TWILIO_AUTH_TOKEN: !Ref TwilioAuthToken
           OCTOPODS_WEBHOOK_URLS: !Ref OctopodWebhookUrls
+          SES_FROM_ADDRESS: !Ref SesFromAddress
+          ALERT_TO_ADDRESS: !Ref SmsInterceptorAlertTo
+          # Dry-run: "1" = no writes/side-effects, response shows what WOULD happen.
+          # Declared here so every deploy resets it to off.
+          DEBUG: "0"
           # Maps Twilio numbers to channel names. Edit this JSON to add/remove numbers.
           # Format: {"ChannelName": ["+1XXXXXXXXXX", ...], ...}
           # Channel names must match the internal names in the sms_subscriptions HubSpot property.

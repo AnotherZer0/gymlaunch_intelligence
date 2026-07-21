@@ -33,6 +33,8 @@ INPUT  (JSON body or query string)
   start_date      YYYY-MM-DD            (optional — defaults to today UTC; used
                                           for order_date, trigger_dates and the
                                           termed_start_date)
+  hubspot_deal_id HubSpot Deal id       (optional — set on the subscription as
+                                          additional_data.hubspot_deal_id)
 
 RESPONSE
   JSON. On success: {"ok": true, "sf_customer_id": ..., "sf_subscription_id": ...,
@@ -314,9 +316,9 @@ def resolve_customer(conn, token_box, sf_id, email):
 # --- Subscription create ---
 
 def build_subscription_body(customer_id, *, product_id, plan_id,
-                            plan_price_id, price, the_date):
+                            plan_price_id, price, the_date, hubspot_deal_id=None):
     """Assemble the POST /subscriptions JSON body for a one-year Termed sub."""
-    return {
+    body = {
         "customer_id": customer_id,
         "type": "Termed",
         "order_date": the_date,
@@ -345,14 +347,20 @@ def build_subscription_body(customer_id, *, product_id, plan_id,
         # would fire SF's successful-payment logic, which we explicitly don't want.
         "pay_invoice": False,
     }
+    # Associate the subscription with a HubSpot Deal. SF stores this under
+    # `additional_data.hubspot_deal_id` (equivalent to the sc_additional_data_* URL param).
+    if hubspot_deal_id:
+        body["additional_data"] = {"hubspot_deal_id": hubspot_deal_id}
+    return body
 
 
 def create_subscription(conn, token_box, customer_id, *, product_id, plan_id,
-                        plan_price_id, price, the_date):
+                        plan_price_id, price, the_date, hubspot_deal_id=None):
     """POST /subscriptions for a one-year Termed sub. Returns the SF subscription id."""
     body = build_subscription_body(
         customer_id, product_id=product_id, plan_id=plan_id,
         plan_price_id=plan_price_id, price=price, the_date=the_date,
+        hubspot_deal_id=hubspot_deal_id,
     )
     resp = sf_request(conn, token_box, "POST", "/subscriptions", json_body=body)
     if resp.status_code in (200, 201):
@@ -426,7 +434,7 @@ def resolve_price(raw):
 # --- Debug dry run ---
 
 def debug_dry_run(conn, token_box, sf_id, email, *, product_id, plan_id,
-                  plan_price_id, price, the_date, raw_params):
+                  plan_price_id, price, the_date, raw_params, hubspot_deal_id=None):
     """
     Safe dry run for DEBUG mode. Authenticates, fetches a token, and looks up the
     customer READ-ONLY, then returns the exact subscription body that *would* be
@@ -453,6 +461,7 @@ def debug_dry_run(conn, token_box, sf_id, email, *, product_id, plan_id,
     body = build_subscription_body(
         customer_id_for_body, product_id=product_id, plan_id=plan_id,
         plan_price_id=plan_price_id, price=price, the_date=the_date,
+        hubspot_deal_id=hubspot_deal_id,
     )
 
     return reply(200, {
@@ -470,6 +479,7 @@ def debug_dry_run(conn, token_box, sf_id, email, *, product_id, plan_id,
             "plan_price_id": plan_price_id,
             "price": price,
             "date": the_date,
+            "hubspot_deal_id": hubspot_deal_id,
         },
         "token": {"acquired": bool(token), "length": len(token) if token else 0},
         "customer": {
@@ -501,6 +511,7 @@ def lambda_handler(event, context):
         product_id = (params.get("product_id") or "").strip() or DEFAULT_PRODUCT_ID
         plan_id = (params.get("plan_id") or "").strip() or DEFAULT_PLAN_ID
         plan_price_id = (params.get("plan_price_id") or "").strip() or DEFAULT_PLAN_PRICE_ID
+        hubspot_deal_id = (params.get("hubspot_deal_id") or "").strip() or None
 
         if not sf_id and not email:
             return reply(400, {"ok": False, "error": "provide at least one of: id, email"})
@@ -513,7 +524,7 @@ def lambda_handler(event, context):
                 conn, token_box, sf_id, email,
                 product_id=product_id, plan_id=plan_id,
                 plan_price_id=plan_price_id, price=price, the_date=the_date,
-                raw_params=params,
+                raw_params=params, hubspot_deal_id=hubspot_deal_id,
             )
 
         customer_id, created = resolve_customer(conn, token_box, sf_id, email)
@@ -521,6 +532,7 @@ def lambda_handler(event, context):
             conn, token_box, customer_id,
             product_id=product_id, plan_id=plan_id,
             plan_price_id=plan_price_id, price=price, the_date=the_date,
+            hubspot_deal_id=hubspot_deal_id,
         )
 
         return reply(200, {

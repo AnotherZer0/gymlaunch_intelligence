@@ -52,7 +52,8 @@ it lives in the DB and **not** in Secrets Manager. Only the static credentials b
 **Source:** `src/subscriptionflow/create_sub/` · **Trigger:** Lambda Function URL (manually
 managed — the deploy user can't create Function URLs, so it's enabled in the console).
 
-Takes a JSON POST (`id` or `email`, optional `price`/dates/product ids) and:
+Takes a JSON POST (`id` or `email`, optional `price`/dates/product ids, optional
+`hubspot_deal_id`) and:
 1. finds the SF customer by `id`, else by email, else creates one;
 2. creates a **1-year Termed** subscription (`type: "Termed"`, `termed_initial_period: 1 year`,
    `renewal_type: "Renew with Specific Term"`, `is_auto_renew: 0` → it ends after a year).
@@ -67,6 +68,9 @@ Key behaviors:
 - **`pay_invoice` is OFF** — the invoice is left DUE so SF doesn't auto-charge or fire
   payment-success logic.
 - **`price` defaults to `0.00`** when omitted (intentional — corrected after the fact).
+- **`hubspot_deal_id`** (optional) — when the caller sends it, it's written onto the sub as
+  `additional_data.hubspot_deal_id`, linking the SF subscription to a HubSpot Deal (this is where
+  the sync later reads it back from). Omitted → the field isn't sent at all.
 - The **weekly cadence comes from the SF plan config**, not the payload. Confirm the default
   plan is a weekly plan in the SF dashboard.
 - **`DEBUG=1`** makes it a safe dry run: authenticates, looks up the customer read-only, and

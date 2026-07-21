@@ -312,27 +312,46 @@ Currently applies to `gymlaunch-add-slack-channel` and
 Validates the Twilio HMAC-SHA1 signature on every request, writes to RDS, runs opt-out /
 delivery-failure logic, then forwards the raw body to Octopods.
 
+**Last-message tracking** (`/sms/inbound`): EVERY inbound message triggers a HubSpot
+contact lookup (mobilephone first, phone as fallback, multiple format variants in one
+API call). If found, the contact's `last_twilio_sms_message_content` and
+`last_twilio_sms_received` are updated. Unknown numbers are logged and skipped.
+This replaced the HubSpot workflow that previously wrote the last-message field.
+
 **Opt-out handling** (`/sms/inbound`): if the message body exactly matches a CTIA keyword
-(STOP, STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT), the Lambda searches HubSpot for the
-sender's phone number (mobilephone first, phone as fallback, multiple format variants in
-one API call) and sets `sms_opted_out = true` on the contact.
+(STOP, STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT, OPTOUT, REVOKE), the opt-out properties
+are merged into the same PATCH as the last-message update — one API call per message.
 
 **Delivery failure handling** (`/sms/status`): if `ErrorCode` is in `{30006, 30007, 30008}`,
 the Lambda finds the recipient's HubSpot contact and sets `sms_deliverable = false` plus
 `sms_ineligible_reason` to the mapped reason string.
 
+**Failure fallback + alerting:** HubSpot rejects an entire PATCH if any single property
+is invalid. On a failed PATCH the Lambda retries each property individually (good ones
+land, the bad one is isolated), then sends an SES alert to `ALERT_TO_ADDRESS` naming the
+failed properties. The outcome is recorded in `sms_inbound_message.hubspot_update_status`
+(`ok` / `ok_after_fallback` / `partial: ...` / `contact_not_found`).
+
+**DEBUG dry-run:** set env var `DEBUG=1` in the Lambda console. All logic runs (signature
+check, lookup, staging) but nothing is written; the HTTP response is a JSON body showing
+what WOULD happen. Signature failures don't 403 in debug so it can be exercised with curl.
+Every deploy resets the flag to off.
+
 **HubSpot properties required** (must be created manually in portal 43776308):
 
 | Property | Type | Set by |
 |---|---|---|
+| `last_twilio_sms_message_content` | Multi-line text | Every inbound message |
+| `last_twilio_sms_received` | Date picker | Every inbound message (midnight UTC) |
 | `sms_subscriptions` | Multiple checkbox | Enrollment state per channel (options: Marketing, Product Updates, Support) |
 | `sms_marketing_opted_out` | Checkbox | STOP/START on Marketing channel |
 | `sms_product_updates_opted_out` | Checkbox | STOP/START on Product Updates channel |
-| `sms_marketing_opted_out_date` | Date | Set on Marketing STOP; not cleared on START |
+| `sms_marketing_opt_out_date` | Date picker | Set on Marketing STOP; not cleared on START. **API name is `opt_out`, not `opted_out`** — the wrong name shipped originally and silently 400'd every Marketing STOP until 2026-07 |
 | `sms_deliverable` | Checkbox | Hard delivery failure (30006/30007/30008) |
 | `sms_ineligible_reason` | Single-line text | `geo_block` / `carrier_violation` / `carrier_error` |
 
 The `sms_subscriptions` internal option names must match the channel names in `_CHANNEL_PROPS` in `handler.py` exactly (case-sensitive).
+Date-picker properties only accept midnight-UTC epoch milliseconds — a raw `time.time()` value is rejected with `INVALID_DATE`.
 
 ### Twilio signature validation
 

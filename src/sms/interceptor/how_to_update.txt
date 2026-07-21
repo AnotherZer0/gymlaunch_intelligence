@@ -11,21 +11,37 @@ For inbound messages (/sms/inbound):
   1. Validates the Twilio HMAC-SHA1 signature — rejects spoofed requests with 403
   2. Identifies which channel the message arrived on (Marketing / Product Updates)
      using the TWILIO_NUMBER_CHANNELS mapping in template.yaml
-  3. Checks if the body exactly matches an opt-out keyword (case-insensitive):
+  3. Searches HubSpot for the sender by mobilephone, then phone (EVERY message).
+     If found, stages the last-message properties:
+       - last_twilio_sms_message_content = message body
+       - last_twilio_sms_received        = today (date picker, midnight UTC)
+     If not found: logs and skips the HubSpot update (message still recorded in RDS).
+  4. Checks if the body exactly matches an opt-out keyword (case-insensitive):
        STOP, STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT, OPTOUT, REVOKE
-       - Searches HubSpot for the sender by mobilephone, then phone
        - Removes the channel from sms_subscriptions (multiple-checkbox property)
        - Sets sms_*_opted_out = true
-       - Sets sms_marketing_opted_out_date (Marketing channel only)
-       - Creates a note on the contact timeline
-  4. Checks if the body is an opt-in keyword (START, UNSTOP, YES)
-       - Finds the contact
+       - Sets sms_marketing_opt_out_date (Marketing channel only)
+       - Stages a note for the contact timeline
+  5. Checks if the body is an opt-in keyword (START, UNSTOP, YES)
        - Adds the channel back to sms_subscriptions
        - Sets sms_*_opted_out = false
-       - Creates a note on the contact timeline
-  5. Writes a row to sms_inbound_message in RDS
-  6. Forwards the raw request body to Octopods (so HubSpot Conversations still works)
-  7. Returns empty TwiML <Response/> — Twilio handles STOP auto-replies at carrier level
+       - Stages a note
+  6. Sends ALL staged properties in ONE PATCH. If HubSpot rejects the batch
+     (it rejects the whole PATCH when any one property is invalid), retries each
+     property individually so the good ones still land, and emails an SES alert
+     to ALERT_TO_ADDRESS naming exactly which properties failed and why.
+  7. Writes a row to sms_inbound_message in RDS (hubspot_update_status records
+     ok / ok_after_fallback / partial: ... / contact_not_found)
+  8. Forwards the raw request body to Octopods (so HubSpot Conversations still works)
+  9. Returns empty TwiML <Response/> — Twilio handles STOP auto-replies at carrier level
+
+DEBUG DRY-RUN MODE: set DEBUG=1 on the Lambda in the console. Everything runs
+(signature check, contact lookup, property staging) but nothing is written — no
+HubSpot PATCH, no note, no DB row, no Octopods forward, no email. The HTTP
+response becomes a JSON body showing exactly what WOULD happen (would_patch,
+would_create_note, contact_id, etc.). Signature failures don't 403 in debug so
+you can test with curl. The flag is declared in template.yaml so every deploy
+resets it to 0.
 
 For delivery status callbacks (/sms/status):
   1. Validates signature
@@ -49,6 +65,10 @@ If a property doesn't exist, HubSpot returns 400 and the Lambda logs it but cont
 
 Property name                    Type                  Notes
 ----------------------------     ------------------    ----------------------------
+last_twilio_sms_message_content  Multi-line text       Body of the last inbound SMS.
+                                                       Written on EVERY message.
+last_twilio_sms_received         Date (date picker)    Date of the last inbound SMS.
+                                                       Written on EVERY message.
 sms_subscriptions                Multiple checkboxes   Enrollment state per channel.
                                                        Internal names MUST match the
                                                        channel names in _CHANNEL_PROPS
@@ -58,12 +78,20 @@ sms_subscriptions                Multiple checkboxes   Enrollment state per chan
 
 sms_marketing_opted_out          Checkbox (boolean)    Set true on STOP, false on START
 sms_product_updates_opted_out    Checkbox (boolean)    Set true on STOP, false on START
-sms_marketing_opted_out_date     Date (date picker)    Timestamp of most recent
-                                                       Marketing STOP. Not cleared on
-                                                       START — history is preserved.
+sms_marketing_opt_out_date       Date (date picker)    Date of most recent Marketing
+                                                       STOP. Not cleared on START —
+                                                       history is preserved.
+                                                       CAREFUL: API name is opt_out,
+                                                       NOT opted_out. The wrong name
+                                                       shipped originally and silently
+                                                       400'd every Marketing STOP.
 sms_deliverable                  Checkbox (boolean)    Set false on hard delivery failure
 sms_ineligible_reason            Single-line text      Reason code: geo_block |
                                                        carrier_violation | carrier_error
+
+Date-picker properties only accept midnight-UTC epoch milliseconds. A raw
+time.time()*1000 value is rejected by HubSpot with INVALID_DATE — use the
+_today_midnight_utc_ms() helper in handler.py.
 
 
 HOW TO ADD A NEW TWILIO NUMBER (same channel)
